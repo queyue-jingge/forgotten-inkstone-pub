@@ -84,8 +84,10 @@ lessons/     讲过的讲稿落盘（默认空）
 - **KaTeX 0.16.9**（含 auto-render 扩展与配套 woff2 字体）—— 公式渲染，见 `web/vendor/katex.*`、`auto-render.min.js`、`fonts/`。
 - **marked 15.0.12** —— markdown 解析，见 `web/vendor/marked.min.js`。
 
-各自的版权与许可写在文件头注释里；本项目整体按 MIT 发布（见 `LICENSE`）。
+第三方库各自的版权与许可写在文件头注释里。**注意**：上面这些是第三方库、走 MIT；但**本台自身**不是 MIT，而是 **PolyForm Noncommercial 1.0.0**——个人、学习、研究、教学、非营利均可自由使用与修改，**禁止任何商业用途**，见 `LICENSE`。
 
 ## License
 
-MIT
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
+
+个人、研究、学习、教学、非营利组织均可自由使用与修改；**禁止商业使用**。第三方组件（KaTeX、marked）各自仍为 MIT，见上节。
