@@ -29,13 +29,13 @@
 export TEACH_BOOKS=/path/to/books
 
 # 2) 起网页服务
-TEACH_PASS=你的口令 python3 server.py      # 默认端口 54862
+TEACH_PASS=你的口令 python3 server.py      # 默认端口 8000
 
 # 3) 另开一个终端，起分身驱动器
 python3 driver.py
 ```
 
-浏览器打开 `http://127.0.0.1:54862`。选课程、选章节、点「唤醒本节」，驱动器就会拉起这一章的分身开讲。
+浏览器打开 `http://127.0.0.1:8000`。选课程、选章节、点「唤醒本节」，驱动器就会拉起这一章的分身开讲。
 
 ## 配你的课（三张表）
 
@@ -53,11 +53,11 @@ python3 driver.py
 |---|---|---|
 | `TEACH_PASS` | 访问口令 | `changeme`（对外时**必须先改**，否则拒绝启动） |
 | `TEACH_HOST` | 监听地址 | `127.0.0.1`（对外要显式设 `0.0.0.0`） |
-| `TEACH_PORT` | 网页端口 | `54862` |
+| `TEACH_PORT` | 网页端口 | `8000` |
 | `TEACH_BOOKS` | 课本 PDF 目录 | `/path/to/books` |
 | `TEACH_QUEUE` | 开讲请求队列文件 | 仓库内 `teach-queue.json` |
 | `TEACH_PROMPT` | 分身人设提示词 | `prompts/白砚.md` |
-| `TEACH_BASE` | 驱动器找网页服务的地址 | `http://127.0.0.1:54862` |
+| `TEACH_BASE` | 驱动器找网页服务的地址 | `http://127.0.0.1:8000` |
 | `TEACH_CLAUDE_BIN` | 起分身的可执行 | `claude` |
 
 ## 分身是怎么起来的

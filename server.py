@@ -40,7 +40,7 @@ MEDIA = os.path.join(ROOT, "media")
 INBOX = os.path.join(ROOT, "inbox.jsonl")
 SESSIONS = os.path.join(STATE, "sessions.json")           # 哪些章"开过"（有会话 id）
 TEACH_QUEUE = os.environ.get("TEACH_QUEUE", os.path.join(ROOT, "teach-queue.json"))  # 开讲请求 → 控制端 读
-PORT = int(os.environ.get("TEACH_PORT", "54862"))
+PORT = int(os.environ.get("TEACH_PORT", "8000"))
 HOST = os.environ.get("TEACH_HOST", "127.0.0.1")   # 默认只听本机；对外要显式设 TEACH_HOST=0.0.0.0
 
 # ---- 访问口令（本地 127.0.0.1 直接放行，外网要口令） ----

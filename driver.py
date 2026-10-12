@@ -10,7 +10,7 @@
 白砚 = 一个 claude -p 常驻子进程，stdin 走 stream-json 喂 user 消息，
         stdout 只看 system/init 拿 session_id 记档。
 
-跑：   TEACH_BASE=http://127.0.0.1:54862 python3 driver.py
+跑：   TEACH_BASE=http://127.0.0.1:8000 python3 driver.py
 空跑： DRIVER_DRY=1 python3 driver.py        # 不动真进程，只打日志
 """
 import json
@@ -27,7 +27,7 @@ SESSIONS = os.path.join(STATE, "sessions.json")
 INBOX = os.path.join(ROOT, "inbox.jsonl")
 PROMPT_FILE = os.environ.get("TEACH_PROMPT", os.path.join(ROOT, "prompts", "白砚.md"))
 LOG = os.path.join(ROOT, "driver.log")
-BASE = os.environ.get("TEACH_BASE", "http://127.0.0.1:54862")
+BASE = os.environ.get("TEACH_BASE", "http://127.0.0.1:8000")
 CLAUDE_BIN = os.environ.get("TEACH_CLAUDE_BIN", "claude")
 DRY = os.environ.get("DRIVER_DRY") == "1"
 POLL = float(os.environ.get("DRIVER_POLL", "2"))
