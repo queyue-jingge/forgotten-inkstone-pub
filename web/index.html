@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>讲课台</title>
+<link rel="stylesheet" href="/static/vendor/katex.min.css">
+<link rel="stylesheet" href="/static/style.css?v=35">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">讲课台</div>
+  <select id="coursesel" class="pick" title="课程"></select>
+  <select id="chaptersel" class="pick" title="章节"></select>
+  <button id="livetoggle" class="livebtn" type="button"></button>
+  <div class="volwrap" id="volwrap"></div>
+  <div class="spacer"></div>
+  <div class="inktools" id="inktools">
+    <button id="boardtoggle" class="livebtn" type="button" title="打开白板">▦ 白板</button>
+    <button id="boardfull" class="livebtn" type="button" title="白板全屏">⛶ 全屏</button>
+    <button id="boardreset" class="livebtn" type="button" title="把白板还原成纯白（清墨迹 + 隐掉题图）">⟲ 还原</button>
+    <span class="inkseg" id="inkseg" hidden>
+      <button id="inkpen" class="inkbtn on" type="button" title="画笔">笔</button>
+      <button id="inkeraser" class="inkbtn" type="button" title="橡皮（划过即删整笔）">擦</button>
+      <button id="inkclear" class="inkbtn" type="button" title="清空本页墨迹">清</button>
+      <button id="inkread" class="inkbtn" type="button" title="把本页连墨迹放进打字框">读给白砚</button>
+    </span>
+    <button id="inktoggle" class="livebtn" type="button" title="在课本页上标注">✎ 标注</button>
+  </div>
+  <a id="logout" class="livebtn" href="/logout" title="退出登录">退出</a>
+  <div class="status" id="status"><span class="dot off"></span><span id="statustext">连接中</span></div>
+</header>
+
+<main class="stage">
+  <section class="pane left">
+    <div class="pane-head">
+      <span id="pdfhead">教材</span>
+      <span class="spacer"></span>
+      <span class="pager">
+        <button id="prev" title="上一页">‹</button>
+        <input id="pagebox" type="text" inputmode="numeric" title="PDF 页">
+        <button id="next" title="下一页">›</button>
+        <span class="bookpage" id="bookpage"></span>
+      </span>
+      <span class="zoom">
+        <button id="zoomout" title="缩小">−</button>
+        <button id="zoomfit" title="恢复适屏">100%</button>
+        <button id="zoomin" title="放大">＋</button>
+      </span>
+    </div>
+    <div class="pdfscroll" id="pdfscroll">
+      <img id="pageimg" alt="">
+      <div class="pdfhint" id="pdfhint">翻页中…</div>
+    </div>
+    <div class="board" id="board" hidden>
+      <div class="boardsheet" id="boardsheet">
+        <img id="boardimg" alt="">
+      </div>
+      <div class="boardzoom" id="boardzoom">
+        <button id="bzoomout" type="button" title="缩小">−</button>
+        <span id="bzoomval">100%</span>
+        <button id="bzoomin" type="button" title="放大">＋</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="pane right">
+    <div class="pane-head">讲稿 · 对话</div>
+    <div class="hint" id="hint"></div>
+    <div class="chat" id="chat">
+      <div class="lesson" id="lesson"></div>
+      <div class="pending" id="pending"></div>
+    </div>
+    <div class="rail" id="rail"></div>
+    <div class="boardoffer" id="boardoffer" hidden>
+      <span>白砚想开一块板</span>
+      <button type="button" id="boardview">开板</button>
+      <button type="button" id="boardofferx" class="bo-x" title="先不开">×</button>
+    </div>
+    <form class="composer" id="composer">
+      <div class="attach" id="attach"></div>
+      <div class="row">
+        <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行；截图可直接粘贴或拖进来）"></textarea>
+        <button type="submit" id="send">发送</button>
+      </div>
+    </form>
+  </section>
+</main>
+
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/katex.min.js"></script>
+<script src="/static/vendor/auto-render.min.js"></script>
+<script src="/static/app.js?v=35"></script>
+</body>
+</html>

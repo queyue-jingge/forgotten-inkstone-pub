@@ -1,0 +1,21 @@
+# 运行时 / 生成物，不入库
+cache/
+__pycache__/
+*.pyc
+*.log
+media/
+state/
+draw/
+inbox.jsonl
+teach-queue.json
+
+# 教材与讲稿不放仓库
+*.pdf
+*.txt
+!requirements.txt
+
+# 杂项
+*.bak
+venv/
+.venv/
+.DS_Store
