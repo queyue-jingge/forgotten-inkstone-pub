@@ -1,0 +1,599 @@
+diff --git a/README.md b/README.md
+index 83dba04..fd25324 100644
+--- a/README.md
++++ b/README.md
+@@ -24,7 +24,7 @@
+ 
+ ## 跑起来
+ 
+-依赖：**Python 3**（纯标准库，无 pip 依赖，见 `requirements.txt`）；把 PDF 页渲成图、抽文字层用到 **poppler**（`pdftoppm` / `pdftotext`）；讲义分身默认调用 `claude` CLI（可用 `TEACH_CLAUDE_BIN` 换成别的）。暂无自动化测试。
++依赖：**Python 3**（纯标准库，无 pip 依赖，见 `requirements.txt`）；把 PDF 页渲成图、抽文字层用到 **poppler**（`pdftoppm` / `pdftotext`）；讲义分身默认调用 `claude` CLI（用 `TEACH_CLAUDE_BIN` / `TEACH_CLAUDE_ARGS` 换成任意说 Claude Code stream-json 协议的命令行）。跑测试：`python3 -m unittest discover -s tests`。
+ 
+ ```bash
+ # 1) 放课本：把 PDF 丢进一个目录，用 TEACH_BOOKS 指过去
+@@ -60,11 +60,45 @@ python3 driver.py
+ | `TEACH_QUEUE` | 开讲请求队列文件 | 仓库内 `teach-queue.json` |
+ | `TEACH_PROMPT` | 分身人设提示词 | `prompts/白砚.md` |
+ | `TEACH_BASE` | 驱动器找网页服务的地址 | `http://127.0.0.1:8000` |
+-| `TEACH_CLAUDE_BIN` | 起分身的可执行 | `claude` |
++| `TEACH_CLAUDE_BIN` | 起分身的可执行（**只放程序**：PATH 上的名字或绝对路径，如 `claude`） | `claude` |
++| `TEACH_CLAUDE_ARGS` | 程序之后的全部 flag；支持 4 个占位符，设为空串则一个 flag 都不传 | 见下方默认模板 |
++| `TEACH_CLAUDE_RESUME_FLAG` | `{resume}` 展开用的续会话 flag 名（单个名字，不能含空白） | `--resume` |
++
++### 换成别的 agent
++
++不设 `TEACH_CLAUDE_ARGS` 时用的默认模板，跟旧版写死的 flag 逐 token 一致：
++
++```
++-p --input-format stream-json --output-format stream-json --verbose --dangerously-skip-permissions --append-system-prompt {prompt} {resume}
++```
++
++| 占位符 | 展开为 |
++|---|---|
++| `{prompt}` | `prompts/白砚.md` 的内容，作为**单个** argv token |
++| `{prompt_file}` | 该文件的绝对路径（给「路径存在就读文件、否则当文本」的 CLI 用） |
++| `{session}` | 会话 id；没有则空串 |
++| `{resume}` | 有会话 → `<resume 名> <sid>` 两个 token；没有 → 零个 token |
++
++其余 `{xxx}` 原样传给 agent（启动时告警一次）。
++
++**分词规则**：按空白切分；成对的 `"` 把含空格的片段括成一项且引号本身去掉；反斜杠**不作转义**（Windows 路径 `C:\Users\...` 不会被吃掉）；引号不配对 → 启动即报错退出。不采用 JSON 数组格式，因为 cmd.exe 里引号转义太痛苦。
++
++配置错误（引号不配对、`TEACH_CLAUDE_RESUME_FLAG` 含空白）会在启动时打中文报错并以 **exit code 2** 退出，不进主循环。`DRIVER_DRY=1 python3 driver.py` 会把展开后的完整命令行打进日志——不装任何 agent 也能校验配置。
++
++环境变量在驱动启动时读一次，**运行中改了不生效，重启驱动器才生效**。
++
++#### 例：用 pi 起白砚
++
++`pi` 1.0.0 直连不行（不认 `--input-format` / `--output-format` / `--dangerously-skip-permissions`），需要一层适配Claude stream-json的shim：
++
++```bat
++pi install npm:@ladbabynpm/picc-claude-shim
++set TEACH_CLAUDE_BIN=C:\Users\<你>\.pi\agent\extensions\picc-claude-shim\bin\claude.exe
++```
+ 
+ ## 分身是怎么起来的
+ 
+-`driver.py` 是个常驻小进程：盯住每门课 `state/<course>.json` 里的 `live` 字段——哪一章被唤醒，就为它起一个常驻的分身子进程（默认 `claude -p`，也可换成别的）；学生从网页说的话落进 `inbox.jsonl`，驱动器喂给分身；分身讲的内容，自己用 `POST /api/append` 写回网页。一章一个分身，互不干扰。
++`driver.py` 是个常驻小进程：盯住每门课 `state/<course>.json` 里的 `live` 字段——哪一章被唤醒，就为它起一个常驻的分身子进程（默认模板就是 Claude Code 的 `claude -p`；换成任意说 Claude Code stream-json 协议的 CLI 只改环境变量，见上一节）；学生从网页说的话落进 `inbox.jsonl`，驱动器喂给分身；分身讲的内容，自己用 `POST /api/append` 写回网页。一章一个分身，互不干扰。
+ 
+ 分身的**人设**写在 `prompts/白砚.md`——讲什么、怎么讲、语气如何，都在里面调。它在讲之前会跑一句 `python3 teach.py view <course> [页]`，拿到那一页的文字层和一张图，真的看过了再开口。
+ 
+@@ -78,6 +112,7 @@ driver.py    分身驱动器（起停分身、喂话）
+ teach.py     小工具：分身讲某页前，看那页的文字层与图
+ web/         前端（讲稿流、PDF、白板、手写）
+ prompts/     分身人设
++tests/       单测（python3 -m unittest discover -s tests）
+ lessons/     讲过的讲稿落盘（默认空）
+ ```
+ 
+diff --git a/driver.py b/driver.py
+index e8a1174..0e95bce 100644
+--- a/driver.py
++++ b/driver.py
+@@ -7,16 +7,20 @@
+   · 网页新话落进 inbox.jsonl → 喂给当前白砚
+   · 白砚自己用讲课台接口（/api/append 等）写回讲稿，本驱动器不管它的输出内容
+ 
+-白砚 = 一个 claude -p 常驻子进程，stdin 走 stream-json 喂 user 消息，
+-        stdout 只看 system/init 拿 session_id 记档。
++白砚 = 一个由 TEACH_CLAUDE_BIN / TEACH_CLAUDE_ARGS 指定的、说 Claude Code
++        stream-json 协议的常驻子进程（默认 claude），stdin 走 stream-json
++        喂 user 消息，stdout 只看 system/init 拿 session_id 记档。
+ 
+ 跑：   TEACH_BASE=http://127.0.0.1:8000 python3 driver.py
+ 空跑： DRIVER_DRY=1 python3 driver.py        # 不动真进程，只打日志
+ """
+ import json
+ import os
++import re
++import shutil
+ import signal
+ import subprocess
++import sys
+ import threading
+ import time
+ import urllib.request
+@@ -25,13 +29,133 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
+ STATE = os.path.join(ROOT, "state")
+ SESSIONS = os.path.join(STATE, "sessions.json")
+ INBOX = os.path.join(ROOT, "inbox.jsonl")
+-PROMPT_FILE = os.environ.get("TEACH_PROMPT", os.path.join(ROOT, "prompts", "白砚.md"))
++PROMPT_FILE = os.environ.get("TEACH_PROMPT") or os.path.join(ROOT, "prompts", "白砚.md")
++if not os.path.isabs(PROMPT_FILE):
++    PROMPT_FILE = os.path.join(ROOT, PROMPT_FILE)
+ LOG = os.path.join(ROOT, "driver.log")
+ BASE = os.environ.get("TEACH_BASE", "http://127.0.0.1:8000")
+-CLAUDE_BIN = os.environ.get("TEACH_CLAUDE_BIN", "claude")
+ DRY = os.environ.get("DRIVER_DRY") == "1"
+ POLL = float(os.environ.get("DRIVER_POLL", "2"))
+ 
++# ---- agent 配置：起哪个 agent、带哪些 flag 全由环境变量决定 ----
++# 上面是纯函数（好测），下面 import 时读一次环境变量；driver.py 里不写死任何 Claude 参数。
++
++
++class ConfigError(Exception):
++    """启动阶段的配置错误：报错后以 exit code 2 退出，不进主循环。"""
++
++
++DEFAULT_ARGS = ("-p --input-format stream-json --output-format stream-json --verbose "
++                "--dangerously-skip-permissions --append-system-prompt {prompt} {resume}")
++PLACEHOLDERS = ("prompt", "prompt_file", "session", "resume")
++DEFAULT_RESUME_FLAG = "--resume"
++_KNOWN = "、".join("{" + p + "}" for p in PLACEHOLDERS)
++_BRACED = re.compile(r"\{([^{}]*)\}")
++
++
++def split_args(s):
++    """把 TEACH_CLAUDE_ARGS 切成一串 token。
++
++    按空白切分；成对的 " 把含空格的片段括成一项且引号本身去掉；
++    反斜杠不作转义（Windows 路径里的反斜杠原样保留，也不给空格转义）；
++    引号不配对 → ConfigError。
++    """
++    tokens = []
++    cur = []
++    started = False
++    in_quote = False
++    for ch in s:
++        if ch == '"':
++            in_quote = not in_quote
++            started = True
++        elif ch.isspace() and not in_quote:
++            if started:
++                tokens.append("".join(cur))
++                cur = []
++                started = False
++        else:
++            cur.append(ch)
++            started = True
++    if in_quote:
++        raise ConfigError(f"TEACH_CLAUDE_ARGS 里的引号不配对：{s}")
++    if started:
++        tokens.append("".join(cur))
++    return tokens
++
++
++def expand_args(tokens, *, prompt, prompt_file, session, resume_flag):
++    """展开 4 个占位符；其余 {xxx} 原样保留（启动时统一告警一次）。"""
++    out = []
++    for tok in tokens:
++        if tok == "{prompt}":
++            out.append(prompt)
++        elif tok == "{prompt_file}":
++            out.append(prompt_file)
++        elif tok == "{session}":
++            out.append(session or "")
++        elif tok == "{resume}":
++            if session:
++                out.extend([resume_flag, session])
++        else:
++            out.append(tok)
++    return out
++
++
++def resolve_bin(name):
++    """PATH 上找可执行文件（Windows 认 PATHEXT：claude → claude.CMD）；找不到给 None。"""
++    if not name:
++        return None
++    try:
++        return shutil.which(name)
++    except Exception:
++        return None
++
++
++def agent_argv(prompt_text, sid, *, bin_name=None, raw_args=None, resume_flag=None):
++    """展开「程序之后」的全部 flag。
++
++    bin_name / raw_args / resume_flag 为 None 时读模块级配置（import 时定下）；
++    测试传显式值，全程不碰 env。
++    """
++    name = RAW_BIN if bin_name is None else bin_name
++    raw = RAW_ARGS if raw_args is None else raw_args
++    flag = RESUME_FLAG if resume_flag is None else resume_flag
++    if name and any(c.isspace() for c in name):
++        _warn_once(f"TEACH_CLAUDE_BIN={name!r} 里有空白：BIN 只放程序本身"
++                   f"（PATH 上的名字或绝对路径），flag 请放 TEACH_CLAUDE_ARGS")
++    return expand_args(split_args(raw), prompt=prompt_text, prompt_file=PROMPT_FILE,
++                       session=str(sid) if sid else "", resume_flag=flag)
++
++
++# import 时读一次环境变量：驱动运行中改环境变量不生效，重启驱动器才生效。
++RAW_BIN = os.environ.get("TEACH_CLAUDE_BIN", "claude")
++_RAW_ARGS_ENV = os.environ.get("TEACH_CLAUDE_ARGS")
++RAW_ARGS = DEFAULT_ARGS if _RAW_ARGS_ENV is None else _RAW_ARGS_ENV   # 显式空串 = 不传 flag
++_RAW_RESUME_ENV = os.environ.get("TEACH_CLAUDE_RESUME_FLAG")
++RESUME_FLAG = DEFAULT_RESUME_FLAG if _RAW_RESUME_ENV is None else _RAW_RESUME_ENV
++AGENT_BIN = resolve_bin(RAW_BIN)
++
++
++def check_config():
++    """启动时校验 agent 配置；返回模板 token 列表。配置错误 → ConfigError。"""
++    tokens = split_args(RAW_ARGS)
++    if not RESUME_FLAG or any(c.isspace() for c in RESUME_FLAG):
++        raise ConfigError(f"TEACH_CLAUDE_RESUME_FLAG={RESUME_FLAG!r} 必须是单个 flag 名"
++                          f"（不能为空、不能含空白）")
++    for tok in tokens:
++        for name in _BRACED.findall(tok):
++            if name not in PLACEHOLDERS:
++                _warn_once(f"TEACH_CLAUDE_ARGS 里的 {{{name}}} 不认识，会原样传给 agent"
++                           f"（只有 {_KNOWN} 这 4 个会被展开）")
++    return tokens
++
++
++def describe_agent(tokens):
++    """启动时打一行配置，方便跟报错对照。"""
++    bin_txt = AGENT_BIN or f"{RAW_BIN}（PATH 上没找到）"
++    return (f"agent: bin={bin_txt} args={subprocess.list2cmdline(tokens)} "
++            f"resume_flag={RESUME_FLAG}")
++
+ 
+ def log(msg):
+     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
+@@ -46,6 +170,16 @@ def log(msg):
+         pass
+ 
+ 
++_WARNED = set()
++
++
++def _warn_once(msg):
++    if msg in _WARNED:
++        return
++    _WARNED.add(msg)
++    log(msg)
++
++
+ def load_json(path, default):
+     try:
+         with open(path, encoding="utf-8") as f:
+@@ -109,6 +243,7 @@ class Session:
+         self.course = course
+         self.chapter = chapter
+         self.proc = None
++        self.argv = None
+         self.sid = None
+         self.fed = 0
+         self.lock = threading.Lock()
+@@ -123,17 +258,13 @@ class Session:
+             log(f"读白砚提示词失败：{e}")
+             prompt = ""
+ 
+-        args = [CLAUDE_BIN, "-p",
+-                "--input-format", "stream-json",
+-                "--output-format", "stream-json",
+-                "--verbose", "--dangerously-skip-permissions",
+-                "--append-system-prompt", prompt]
+-        if sid:
+-            args += ["--resume", sid]
++        argv = [AGENT_BIN or RAW_BIN] + agent_argv(prompt, sid)
++        self.argv = argv
+ 
+         if DRY:
+             log(f"[DRY] 会起白砚：{self.course} 第{self.chapter}章 "
+                 f"{'续 ' + sid if sid else '新开'}")
++            log(f"[DRY] 会起白砚：{subprocess.list2cmdline(argv)}")
+             self.sid = sid or "(dry)"
+             self.fed = self._inbox_len()
+             return
+@@ -141,7 +272,7 @@ class Session:
+         log(f"起白砚：{self.course} 第{self.chapter}章 {'续 ' + sid if sid else '新开'}")
+         env = dict(os.environ, TEACH_DRIVER="1")
+         self.proc = subprocess.Popen(
+-            args, cwd=ROOT, env=env, stdin=subprocess.PIPE,
++            argv, cwd=ROOT, env=env, stdin=subprocess.PIPE,
+             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+         threading.Thread(target=self._read_stdout, daemon=True).start()
+         threading.Thread(target=self._drain_stderr, daemon=True).start()
+@@ -267,10 +398,38 @@ def _on_signal(sig, _frm):
+     os._exit(0)
+ 
+ 
++def _exc_text(e):
++    code = getattr(e, "winerror", None)
++    txt = str(e)
++    if code and f"WinError {code}" not in txt:
++        txt = f"{txt}（WinError {code}）"
++    return f"{type(e).__name__}: {txt}"
++
++
++def _start_hint(e):
++    """按异常类型补一句能照做的提示。"""
++    code = getattr(e, "winerror", None)
++    if code == 193:
++        return "提示：WinError 193 = 这份文件不能直接执行——别指 .ps1，用 .cmd / .exe。"
++    if code == 2 or isinstance(e, FileNotFoundError):
++        return ("提示：BIN 只放程序本身（PATH 上的名字或绝对路径），全部 flag 放 "
++                "TEACH_CLAUDE_ARGS；填了整条带空格的命令就会这样。")
++    return ("提示：用 DRIVER_DRY=1 打一份展开后的命令核对；flag 认不认由 "
++            "TEACH_CLAUDE_ARGS 负责。")
++
++
+ def main():
++    try:
++        tokens = check_config()
++    except ConfigError as e:
++        log(f"配置错误：{e}")
++        log("驱动器不启动。改好环境变量后重跑 python3 driver.py")
++        sys.exit(2)
++
+     signal.signal(signal.SIGTERM, _on_signal)
+     signal.signal(signal.SIGINT, _on_signal)
+     log(f"驱动器启动 | base={BASE} dry={DRY} poll={POLL}s")
++    log(describe_agent(tokens))
+     while True:
+         live = current_live()
+         if live != G["target"]:
+@@ -280,8 +439,22 @@ def main():
+                 G["sess"] = None
+             G["target"] = live
+             if live:
+-                G["sess"] = Session(*live)
+-                G["sess"].start()
++                sess = Session(*live)
++                try:
++                    sess.start()
++                    G["sess"] = sess
++                except Exception as e:
++                    G["sess"] = None
++                    log(f"起白砚失败（{live[0]} 第{live[1]}章）：{_exc_text(e)}")
++                    if sess.argv:
++                        log(f"展开后命令：{subprocess.list2cmdline(sess.argv)}")
++                    log(_start_hint(e))
++                    log("这一章先不动了——改好配置后重新唤醒本章（不会每 2 秒重试）")
++                    try:
++                        if sess.proc:
++                            sess.stop()
++                    except Exception:
++                        pass
+         if G["sess"]:
+             G["sess"].poll_inbox()
+         time.sleep(POLL)
+diff --git a/tests/test_agent_args.py b/tests/test_agent_args.py
+new file mode 100644
+index 0000000..6d9816b
+--- /dev/null
++++ b/tests/test_agent_args.py
+@@ -0,0 +1,242 @@
++#!/usr/bin/env python3
++"""driver.py 的 agent 配置层单测：只用标准库。
++
++跑：python3 -m unittest discover -s tests
++"""
++import ast
++import os
++import sys
++import unittest
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, REPO)
++
++import driver
++
++# 改动前 driver.py 里写死的那串 flag（回归锁定用）
++LEGACY_FLAGS = ["-p", "--input-format", "stream-json", "--output-format", "stream-json",
++                "--verbose", "--dangerously-skip-permissions",
++                "--append-system-prompt"]
++
++
++class DefaultsRegression(unittest.TestCase):
++    """默认配置展开出来必须跟改动前的硬编码 argv 逐 token 一致。"""
++
++    def test_default_template_no_sid(self):
++        got = driver.agent_argv("PROMPT", None, bin_name="agent",
++                                raw_args=driver.DEFAULT_ARGS, resume_flag="--resume")
++        self.assertEqual(got, LEGACY_FLAGS + ["PROMPT"])
++
++    def test_default_template_with_sid(self):
++        got = driver.agent_argv("PROMPT", "abc", bin_name="agent",
++                                raw_args=driver.DEFAULT_ARGS, resume_flag="--resume")
++        self.assertEqual(got, LEGACY_FLAGS + ["PROMPT", "--resume", "abc"])
++
++    def test_program_token_is_resolved_or_raw(self):
++        # 完整 argv = [解析出来的可执行文件 or 原始名] + agent_argv(...)
++        self.assertEqual([driver.AGENT_BIN or driver.RAW_BIN] + ["-p"],
++                         [driver.AGENT_BIN or driver.RAW_BIN, "-p"])
++        self.assertTrue(driver.AGENT_BIN is None or os.path.isabs(driver.AGENT_BIN))
++
++    @unittest.skipIf(os.environ.get("TEACH_CLAUDE_ARGS") is not None,
++                     "TEACH_CLAUDE_ARGS 被显式设置了")
++    def test_module_raw_args_defaults_to_template(self):
++        self.assertEqual(driver.RAW_ARGS, driver.DEFAULT_ARGS)
++
++    @unittest.skipIf(os.environ.get("TEACH_CLAUDE_BIN") is not None,
++                     "TEACH_CLAUDE_BIN 被显式设置了")
++    def test_module_raw_bin_defaults_to_claude(self):
++        self.assertEqual(driver.RAW_BIN, "claude")
++
++    @unittest.skipIf(os.environ.get("TEACH_CLAUDE_RESUME_FLAG") is not None,
++                     "TEACH_CLAUDE_RESUME_FLAG 被显式设置了")
++    def test_module_resume_flag_default(self):
++        self.assertEqual(driver.RESUME_FLAG, "--resume")
++
++    def test_default_template_tokens_are_legacy_tokens(self):
++        self.assertEqual(driver.split_args(driver.DEFAULT_ARGS),
++                         LEGACY_FLAGS + ["{prompt}", "{resume}"])
++
++
++class SplitArgs(unittest.TestCase):
++    def test_whitespace_and_newlines(self):
++        self.assertEqual(driver.split_args("  -a\t-b\n -c  "), ["-a", "-b", "-c"])
++
++    def test_quoted_group_keeps_spaces(self):
++        self.assertEqual(driver.split_args('-x "a b" -y'), ["-x", "a b", "-y"])
++
++    def test_quotes_stripped_mid_token(self):
++        self.assertEqual(driver.split_args('--p="a b"'), ["--p=a b"])
++
++    def test_backslash_not_an_escape(self):
++        bs = chr(92)
++        raw = "C:" + bs + "Users" + bs + "x" + bs + "y.json"
++        self.assertEqual(driver.split_args(raw), [raw])
++        self.assertEqual(driver.split_args('"a ' + bs + ' b"'), ["a " + bs + " b"])
++
++    def test_empty(self):
++        self.assertEqual(driver.split_args(""), [])
++        self.assertEqual(driver.split_args("   \n\t "), [])
++
++    def test_empty_quoted_token(self):
++        self.assertEqual(driver.split_args('-x ""'), ["-x", ""])
++
++    def test_unbalanced_quote_raises(self):
++        with self.assertRaises(driver.ConfigError):
++            driver.split_args('--x "unclosed')
++        with self.assertRaises(driver.ConfigError):
++            driver.split_args('--x "unclosed ')
++
++
++class ExpandArgs(unittest.TestCase):
++    def _expand(self, tokens, **kw):
++        kw.setdefault("prompt", "PROMPT")
++        kw.setdefault("prompt_file", "/abs/prompts/白砚.md")
++        kw.setdefault("session", "")
++        kw.setdefault("resume_flag", "--resume")
++        return driver.expand_args(tokens, **kw)
++
++    def test_prompt_and_prompt_file(self):
++        self.assertEqual(self._expand(["{prompt}", "{prompt_file}"]),
++                         ["PROMPT", "/abs/prompts/白砚.md"])
++
++    def test_session_placeholder(self):
++        self.assertEqual(self._expand(["--id", "{session}"], session="s1"), ["--id", "s1"])
++        self.assertEqual(self._expand(["--id", "{session}"]), ["--id", ""])
++
++    def test_resume_placeholder_with_session_is_two_tokens(self):
++        self.assertEqual(self._expand(["{resume}"], session="abc"), ["--resume", "abc"])
++
++    def test_resume_placeholder_without_session_is_zero_tokens(self):
++        self.assertEqual(self._expand(["-p", "{resume}", "-v"]), ["-p", "-v"])
++
++    def test_custom_resume_flag(self):
++        self.assertEqual(self._expand(["{resume}"], session="abc", resume_flag="--continue"),
++                         ["--continue", "abc"])
++
++    def test_unknown_placeholder_kept_verbatim(self):
++        self.assertEqual(self._expand(["--x", "{foo}", "{prompt}bar", "{ }"]),
++                         ["--x", "{foo}", "{prompt}bar", "{ }"])
++
++
++class ResolveBin(unittest.TestCase):
++    def test_missing_name_gives_none(self):
++        self.assertIsNone(driver.resolve_bin("definitely-not-a-real-agent-xyz"))
++
++    def test_empty_gives_none(self):
++        self.assertIsNone(driver.resolve_bin(""))
++
++
++class AgentArgvConfig(unittest.TestCase):
++    def test_empty_raw_args_means_no_flags(self):
++        self.assertEqual(driver.agent_argv("PROMPT", None, bin_name="x", raw_args=""), [])
++        self.assertEqual(
++            driver.agent_argv("PROMPT", "s1", bin_name="x", raw_args="",
++                              resume_flag="--resume"), [])
++
++    def test_none_raw_args_reads_module_config(self):
++        expected = driver.agent_argv("PROMPT", "s1", bin_name="x",
++                                     raw_args=driver.RAW_ARGS, resume_flag="--resume")
++        self.assertEqual(
++            driver.agent_argv("PROMPT", "s1", bin_name="x", raw_args=None,
++                              resume_flag="--resume"), expected)
++
++    def test_explicit_kwargs_never_read_env(self):
++        keys = ("TEACH_CLAUDE_BIN", "TEACH_CLAUDE_ARGS", "TEACH_CLAUDE_RESUME_FLAG")
++        keep = {k: os.environ.get(k) for k in keys}
++        raw_args_before, resume_flag_before = driver.RAW_ARGS, driver.RESUME_FLAG
++        try:
++            os.environ["TEACH_CLAUDE_BIN"] = "poisoned bin"
++            os.environ["TEACH_CLAUDE_ARGS"] = "--poisoned"
++            os.environ["TEACH_CLAUDE_RESUME_FLAG"] = "--poisoned-resume"
++            got = driver.agent_argv("P", "s1", bin_name="x",
++                                    raw_args="--a {session} {resume}", resume_flag="--r")
++        finally:
++            for k, v in keep.items():
++                if v is None:
++                    os.environ.pop(k, None)
++                else:
++                    os.environ[k] = v
++        self.assertEqual(got, ["--a", "s1", "--r", "s1"])
++        self.assertEqual(driver.RAW_ARGS, raw_args_before)
++        self.assertEqual(driver.RESUME_FLAG, resume_flag_before)
++
++    def test_bin_with_space_warns_once_but_is_not_fatal(self):
++        # 老式「整条命令」写法：不抛异常，只告警一次（提示把 flag 挪去 TEACH_CLAUDE_ARGS）
++        seen = []
++        old_log = driver.log
++        driver.log = seen.append
++        try:
++            driver._WARNED.clear()
++            got = driver.agent_argv("PROMPT", None,
++                                    bin_name="claude --dangerously-skip-permissions",
++                                    raw_args="")
++            driver.agent_argv("PROMPT", None,
++                              bin_name="claude --dangerously-skip-permissions", raw_args="")
++        finally:
++            driver.log = old_log
++        self.assertEqual(got, [])
++        self.assertEqual(len(seen), 1)
++
++
++class CheckConfig(unittest.TestCase):
++    def test_good_config_returns_template_tokens(self):
++        self.assertEqual(driver.check_config(), driver.split_args(driver.RAW_ARGS))
++
++    def test_unbalanced_quote_is_fatal(self):
++        old = driver.RAW_ARGS
++        driver.RAW_ARGS = '--x "unclosed'
++        try:
++            with self.assertRaises(driver.ConfigError):
++                driver.check_config()
++        finally:
++            driver.RAW_ARGS = old
++
++    def test_resume_flag_with_space_is_fatal(self):
++        old = driver.RESUME_FLAG
++        driver.RESUME_FLAG = "--res ume"
++        try:
++            with self.assertRaises(driver.ConfigError):
++                driver.check_config()
++        finally:
++            driver.RESUME_FLAG = old
++
++    def test_empty_resume_flag_is_fatal(self):
++        old = driver.RESUME_FLAG
++        driver.RESUME_FLAG = ""
++        try:
++            with self.assertRaises(driver.ConfigError):
++                driver.check_config()
++        finally:
++            driver.RESUME_FLAG = old
++
++
++class NoHardcodedClaudeFlags(unittest.TestCase):
++    """driver.py 里不许再出现 Claude 专有参数（只能躺在 DEFAULT_ARGS 模板里）。"""
++
++    def _source_without_docstring(self):
++        with open(os.path.join(REPO, "driver.py"), encoding="utf-8") as f:
++            src = f.read()
++        tree = ast.parse(src)
++        head = tree.body[0] if tree.body else None
++        doc = (head.value.value
++               if isinstance(head, ast.Expr) and isinstance(head.value, ast.Constant)
++               and isinstance(head.value.value, str) else "")
++        return src.replace(doc, "", 1) if doc else src
++
++    def test_flags_only_live_in_default_template(self):
++        src = self._source_without_docstring()
++        for flag in ("--input-format", "--output-format", "--verbose",
++                     "--dangerously-skip-permissions", "--append-system-prompt",
++                     "--resume"):
++            self.assertEqual(src.count(flag), 1,
++                             f"{flag} 在 driver.py 里出现 {src.count(flag)} 次，应为 1 次")
++
++    def test_no_claude_bin_constant_left(self):
++        with open(os.path.join(REPO, "driver.py"), encoding="utf-8") as f:
++            src = f.read()
++        self.assertNotIn("CLAUDE_BIN =", src)
++
++
++if __name__ == "__main__":
++    unittest.main()

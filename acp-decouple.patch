@@ -1,0 +1,3277 @@
+# acp-decouple.patch — 讲义分身：从写死的 claude stream-json 参数改为 ACP (Agent Client Protocol)
+#
+# base:     2c179c7 (2c179c73a384c3846e89fc0e7832ee4be87536b5)
+# apply:    git apply acp-decouple.patch        # 只试不改：git apply --check acp-decouple.patch
+# reverse:  git apply -R acp-decouple.patch
+# files:    README.md, requirements.txt, driver.py (改) + acp.py, tests/* (新增)
+# tests:    python -m unittest discover -s tests      # 本机: C:\msys64\mingw64\bin\python.exe (3.12.12)
+#
+diff --git a/README.md b/README.md
+index 83dba04..0abddcb 100644
+--- a/README.md
++++ b/README.md
+@@ -24,7 +24,7 @@
+ 
+ ## 跑起来
+ 
+-依赖：**Python 3**（纯标准库，无 pip 依赖，见 `requirements.txt`）；把 PDF 页渲成图、抽文字层用到 **poppler**（`pdftoppm` / `pdftotext`）；讲义分身默认调用 `claude` CLI（可用 `TEACH_CLAUDE_BIN` 换成别的）。暂无自动化测试。
++依赖：**Python 3**（纯标准库，无 pip 依赖，见 `requirements.txt`）；把 PDF 页渲成图、抽文字层用到 **poppler**（`pdftoppm` / `pdftotext`）；讲义分身是一个**说 ACP 的 agent**，由 `TEACH_AGENT_BIN` 指定（见「接一个 ACP 分身」）。跑测试：`python3 -m unittest discover -s tests`。
+ 
+ ```bash
+ # 1) 放课本：把 PDF 丢进一个目录，用 TEACH_BOOKS 指过去
+@@ -33,8 +33,8 @@ export TEACH_BOOKS=/path/to/books
+ # 2) 起网页服务
+ TEACH_PASS=你的口令 python3 server.py      # 默认端口 8000
+ 
+-# 3) 另开一个终端，起分身驱动器
+-python3 driver.py
++# 3) 另开一个终端，起分身驱动器（先装好 ACP agent，见「接一个 ACP 分身」）
++TEACH_AGENT_BIN=claude-code-acp python3 driver.py
+ ```
+ 
+ 浏览器打开 `http://127.0.0.1:8000`。选课程、选章节、点「唤醒本节」，驱动器就会拉起这一章的分身开讲。
+@@ -60,13 +60,83 @@ python3 driver.py
+ | `TEACH_QUEUE` | 开讲请求队列文件 | 仓库内 `teach-queue.json` |
+ | `TEACH_PROMPT` | 分身人设提示词 | `prompts/白砚.md` |
+ | `TEACH_BASE` | 驱动器找网页服务的地址 | `http://127.0.0.1:8000` |
+-| `TEACH_CLAUDE_BIN` | 起分身的可执行 | `claude` |
++| `TEACH_AGENT_BIN` | 起分身的可执行（**只放程序**：PATH 上的名字或绝对路径）；得是**说 ACP 的 agent**，不是任意 CLI | **必填** |
++| `TEACH_AGENT_ARGS` | 程序之后的全部 flag；支持 3 个占位符，默认空串（一个 flag 都不传） | 空 |
++| `TEACH_AGENT_SYSTEM_PROMPT` | 人格走哪条通道：`meta` / `meta_append` / `args` / `both` / `none` | `meta` |
++| `TEACH_AGENT_PERMISSION` | 分身请求工具权限时怎么答：`allow` / `deny` / `cancel` | `allow` |
++| `TEACH_AGENT_LOG_UPDATES` | `1` = 把分身的流式说话也打进日志（默认只记工具调用） | `0` |
++| `TEACH_AGENT_PROTOCOL` | ACP 协议版本；这一版只实现了 `1` | `1` |
++| `TEACH_DRY` | `1` = 空跑：不 spawn，只把命令、人格通道、三帧 JSON 打进日志 | `0` |
++| `TEACH_POLL` | 驱动器扫 live / 收件箱的间隔（秒） | `2` |
++
++## 接一个 ACP 分身
++
++分身（默认人设叫「白砚」）是一个**说 ACP 的常驻子进程**。ACP（Agent Client Protocol）就是 **stdio 上的 JSON-RPC 2.0**：一行一帧、UTF-8；本实现走 **v1**。讲台这边当 client，agent 那边当 server——`driver.py` 负责起停它、跟它握手、把学生的话喂进去。
++
++先装一个 ACP agent，再用 `TEACH_AGENT_BIN` 指过去（**必填**，只放程序本身）：
++
++```bat
++set TEACH_AGENT_BIN=claude-code-acp                                 :: npm i -g @zed-industries/claude-code-acp（读 _meta.systemPrompt）
++set TEACH_AGENT_BIN=opencode & set TEACH_AGENT_ARGS=acp             :: 本机已有 opencode
++set TEACH_AGENT_BIN=C:\path\to\my-acp-agent.exe                    :: 自研 agent
++```
++
++`TEACH_AGENT_ARGS` 是**程序之后**的全部 flag，按空白切成 argv；默认空串（一个 flag 都不传）——多数 ACP agent 不需要额外参数。里面可以放三个占位符：
++
++| 占位符 | 展开为 |
++|---|---|
++| `{prompt}` | `prompts/白砚.md` 的内容，作为**单个** argv token（带换行、带空格也整块传，不再切） |
++| `{prompt_file}` | 该文件的绝对路径（给「路径存在就读文件、否则当文本」的 CLI 用） |
++| `{session}` | 已经知道的会话 id；没有则空串 |
++
++其余 `{xxx}` 原样传给 agent（启动时告警一次）。`{prompt}` / `{prompt_file}` 只在人格走 `args` / `both` 通道时才有内容，见下一节。
++
++**分词规则**：按空白切分；成对的 `"` 把含空格的片段括成一项且引号本身去掉；反斜杠**不作转义**（Windows 路径 `C:\Users\...` 不会被吃掉）；引号不配对 → 启动即报错退出。不采用 JSON 数组格式，因为 cmd.exe 里引号转义太痛苦。
++
++配置错误（`TEACH_AGENT_BIN` 没设或含空白、PATH 上找不到、引号不配对、通道 / 权限取值非法、协议版本不是 1）会在启动时打中文报错并以 **exit code 2** 退出，不进主循环。`TEACH_DRY=1 TEACH_AGENT_BIN=x python3 driver.py` 会把「会执行什么命令、人格走哪条通道、将要发的三帧 JSON、第一句交代全文」都打进日志——**不装任何 agent 也能校验配置**。
++
++环境变量在驱动启动时读一次，**运行中改了不生效，重启驱动器才生效**。
++
++## 人格 = 系统提示
++
++`prompts/白砚.md` 是分身的人格，**默认走系统提示通道**：驱动器把全文交给 ACP 客户端，客户端挂在 `session/new`（续会话时是 `session/load`）的 `_meta.systemPrompt` 上。人格不占第一句用户消息——第一句只交代「哪门课、哪一章、从哪页起、去讲吧」。
++
++`TEACH_AGENT_SYSTEM_PROMPT` 选通道：
++
++| 取值 | 人格走哪条路 |
++|---|---|
++| `meta`（默认） | 只走 `_meta.systemPrompt` |
++| `meta_append` | 同上（差别只在驱动器日志里点名，方便跟「本机 agent 只认 append」的旧配置对照） |
++| `args` | 只走 argv：`{prompt}` / `{prompt_file}` 展开进 `TEACH_AGENT_ARGS` |
++| `both` | 两条都给 |
++| `none` | 都不给（人格文件完全不发，慎用） |
++
++**为什么无法自检**：人格发出去之后，驱动器看不见 agent 到底把它当没当系统提示——ACP 没有回执。所以要么信 agent 的实现，要么用 `args` 明确塞进命令行。**一键切**：
++
++```bat
++set TEACH_AGENT_SYSTEM_PROMPT=args
++set TEACH_AGENT_ARGS=--system-prompt {prompt}
++```
++
++（`args` 通道下人格是**一个** argv token，不会被空白切开；`{prompt_file}` 给的是文件路径。）
++
++## ACP 能力边界
++
++驱动器这边只实现了 **`session/request_permission`** 这一个 agent→client 方法（按 `TEACH_AGENT_PERMISSION` 答 allow / deny / cancel），并且**不广告任何能力**：`clientCapabilities` 里 `fs` 读写与 `terminal` 全是 `false`，不接 MCP，也不做 elicitation。
++
++意思是：**白砚的文件读写、跑 shell、看图，全得由 agent 自己带**。讲台只负责「喂话、答权限请求、记日志」——讲稿怎么落盘是白砚自己 `POST /api/append` 的事。
++
++## 已知差异（跟旧版直连 CLI 比）
++
++- **人格不再走命令行**：旧版是 `--append-system-prompt {prompt}`，现在是 `_meta.systemPrompt`；想回到命令行就设 `TEACH_AGENT_SYSTEM_PROMPT=args`。
++- **续会话不再用 CLI 的 resume flag**：旧版 `{resume}` 展开成 `<flag> <sid>`，现在走 ACP 的 `session/load`；agent 不支持时驱动器丢掉旧会话、重开一个并落新 sid（日志里会写明）。
++- **环境变量整体改名**：`TEACH_CLAUDE_*` 没了，agent 由 `TEACH_AGENT_BIN` 指定，协议必须是 ACP v1。
+ 
+ ## 分身是怎么起来的
+ 
+-`driver.py` 是个常驻小进程：盯住每门课 `state/<course>.json` 里的 `live` 字段——哪一章被唤醒，就为它起一个常驻的分身子进程（默认 `claude -p`，也可换成别的）；学生从网页说的话落进 `inbox.jsonl`，驱动器喂给分身；分身讲的内容，自己用 `POST /api/append` 写回网页。一章一个分身，互不干扰。
++`driver.py` 是个常驻小进程：盯住每门课 `state/<course>.json` 里的 `live` 字段——哪一章被唤醒，就用 `TEACH_AGENT_BIN` 起一个常驻的 ACP 分身子进程，跟它 `initialize` 握手、`session/new` 开一章的会话（开过的章用 `session/load` 续上）；学生从网页说的话落进 `inbox.jsonl`，驱动器读出来作为 `session/prompt` 喂给分身；分身讲的内容，自己用 `POST /api/append` 写回网页。一章一个分身，互不干扰；同一刻只醒一章。
+ 
+-分身的**人设**写在 `prompts/白砚.md`——讲什么、怎么讲、语气如何，都在里面调。它在讲之前会跑一句 `python3 teach.py view <course> [页]`，拿到那一页的文字层和一张图，真的看过了再开口。
++分身的**人设**写在 `prompts/白砚.md`——讲什么、怎么讲、语气如何，都在里面调，默认作为系统提示挂在会话上（见「人格 = 系统提示」）。它在讲之前会跑一句 `python3 teach.py view <course> [页]`，拿到那一页的文字层和一张图，真的看过了再开口。
+ 
+ > 讲台之外，那套「分身 + 收件箱」背后跑的是什么，见 yet-another-lark-mcp 的 broker-for-claude 分支：https://github.com/a4001234567/yet-another-lark-mcp/tree/broker-for-claude
+ 
+@@ -74,10 +144,12 @@ python3 driver.py
+ 
+ ```
+ server.py    网页服务（静态前端 + 页渲染 + 讲稿/白板/收件箱的小接口）
+-driver.py    分身驱动器（起停分身、喂话）
++driver.py    分身驱动器（起停 ACP 分身、喂话、空跑自检）
++acp.py       ACP v1 客户端（stdio 上的 JSON-RPC 2.0；人格挂 _meta.systemPrompt）
+ teach.py     小工具：分身讲某页前，看那页的文字层与图
+ web/         前端（讲稿流、PDF、白板、手写）
+ prompts/     分身人设
++tests/       单测（python3 -m unittest discover -s tests）
+ lessons/     讲过的讲稿落盘（默认空）
+ ```
+ 
+diff --git a/acp.py b/acp.py
+new file mode 100644
+index 0000000..9d8d21c
+--- /dev/null
++++ b/acp.py
+@@ -0,0 +1,473 @@
++#!/usr/bin/env python3
++"""讲课台 · ACP（Agent Client Protocol）客户端：纯标准库。
++
++一个 AcpClient 管一个说 ACP v1 的 agent 子进程：
++
++    c = AcpClient(TEACH_AGENT_BIN, args, cwd=ROOT, system_prompt=人格)
++    c.start(session_id=sid, load_session=True)   # 握手 + 顺手开/续一个会话
++    c.prompt("学生：……")                          # 一轮话，等它讲完
++    c.close()
++
++线协议：JSON-RPC 2.0、一行一帧（换行符结尾）、UTF-8。agent 的 stdout 只走 ACP
++消息，日志一律 stderr（我照样收下来转给 on_log）。
++
++为什么单开一个 reader 线程：session/prompt 是「一轮讲完才回」的长请求，读和等必须
++分开；而且 agent 会反过来请求我们（session/request_permission），读到那一行就得当
++场答，否则两头一起僵住。
++"""
++import json
++import os
++import subprocess
++import sys
++import threading
++
++PROTOCOL_VERSION = 1
++
++# 不广告 fs / terminal 能力：白砚要动文件自己走 shell，少一个要维护的权限面。
++# 这个字面量会（拷贝一份）进 initialize.params.clientCapabilities；driver 空跑
++# 时也可以直接引用它来打印，免得两边各抄一份慢慢漂移。
++CLIENT_CAPABILITIES = {
++    "fs": {"readTextFile": False, "writeTextFile": False},
++    "terminal": False,
++}
++
++
++class AcpError(Exception):
++    """ACP 层错误：版本不符、agent 报错、连接断了、用法不对。"""
++
++
++class AcpTimeout(AcpError):
++    """等 agent 的响应超时。"""
++
++
++def _log_stderr(line):
++    """默认日志出口：stderr。stdout 是协议通道，日志绝不能混进去。"""
++    try:
++        sys.stderr.write(str(line).rstrip() + "\n")
++        sys.stderr.flush()
++    except Exception:
++        pass
++
++
++class _Pending:
++    """一个在飞请求的槽位：reader 线程填好 result/error 再 set，等待线程 wait。"""
++
++    __slots__ = ("method", "event", "result", "error")
++
++    def __init__(self, method):
++        self.method = method
++        self.event = threading.Event()
++        self.result = None
++        self.error = None
++
++
++class AcpClient:
++    """一个 ACP v1 agent 子进程的同步客户端。
++
++    线程安全：多个 session/prompt 可以同时在飞，响应按 JSON-RPC id 各回各家
++    （决不 FIFO 配对，否则两轮并发就串线）。
++    """
++
++    # 客户端自我介绍，原样进 initialize.params.clientInfo。
++    CLIENT_INFO = {"name": "teach-platform", "title": "讲课台", "version": "0.2.0"}
++
++    def __init__(self, bin_name, argv, *, cwd, env=None, system_prompt=None,
++                 on_permission=None, on_update=None, on_log=None,
++                 init_timeout=60.0):
++        """bin_name + argv 拼成完整命令行（argv 里不放程序名）。
++
++        on_permission(session_id, tool_call, options) -> "allow" | "deny" | "cancel"
++            异常一律按 deny（拿不准就别放行）。
++        on_update(session_id, update, replay)
++            replay=True 表示这帧来自 session/load 的历史重放窗口。
++        on_log(line)  默认写 stderr。
++        init_timeout  握手 / 开会话的等待上限（秒）；prompt 自己带 timeout。
++        """
++        self.bin_name = bin_name
++        self.argv = list(argv or [])
++        self.cwd = cwd
++        self.env = dict(env or {})
++        self.system_prompt = system_prompt
++        self.on_permission = on_permission
++        self.on_update = on_update
++        self.on_log = on_log if on_log is not None else _log_stderr
++        self.init_timeout = float(init_timeout)
++
++        self.proc = None
++        self.session_id = None
++        self.protocol_version = None
++        self.agent_info = None
++        self.agent_capabilities = {}
++        self.load_session = False          # 最近一次 start() 是不是走的续会话
++
++        self._initialized = False
++        self._replay = False               # session/load 重放窗口开着？
++        self._closed = False
++        self._dead = None                  # 管道断掉的原因；置上后新请求直接失败
++        self._close_lock = threading.Lock()
++        self._write_lock = threading.Lock()
++        self._id_lock = threading.Lock()
++        self._next_id = 1                  # 我方请求 id：从 1 开始自增
++        self._pending = {}                 # id -> _Pending
++        self._pending_lock = threading.Lock()
++
++    # ---------------------------------------------------------------- 对外
++
++    def start(self, *, session_id=None, load_session=False):
++        """握一次手，然后开新会话或续旧会话；返回会话信息 dict。
++
++        session_id 给了但 load_session=False 就照样开新的：要不要「续」由调用方
++        明确说，别因为顺手带了个 id 就把旧上下文捞回来。
++
++        返回 {"sessionId", "resumed", "protocolVersion", "agentInfo", "loadSession"}。
++        """
++        if self._closed:
++            raise AcpError("连接已关闭，要重来请新建 AcpClient")
++
++        if self.proc is None or self.proc.poll() is not None:
++            self._spawn()                  # 进程没了（或还没起）就重开
++        if not self._initialized:
++            self._initialize()
++
++        meta = self._meta()
++        cwd = os.path.abspath(self.cwd if self.cwd else os.getcwd())
++        resumed = bool(session_id and load_session)
++        if resumed:
++            params = {"sessionId": session_id, "cwd": cwd, "mcpServers": []}
++        else:
++            params = {"cwd": cwd, "mcpServers": []}
++        if meta is not None:
++            params["_meta"] = meta
++
++        if resumed:
++            # 重放窗口：agent 会在回响应之前先灌一串 session/update（历史）。
++            # 响应一到就关窗——之后再有 update 就是本轮的新内容了。
++            self._replay = True
++            try:
++                self._request("session/load", params, timeout=self.init_timeout)
++            finally:
++                self._replay = False
++            new_sid = session_id
++        else:
++            res = self._request("session/new", params, timeout=self.init_timeout)
++            new_sid = res.get("sessionId") if isinstance(res, dict) else None
++            if not new_sid:
++                raise AcpError(f"session/new 没给 sessionId：{res!r}")
++
++        self.session_id = str(new_sid)
++        self.load_session = resumed
++        return {
++            "sessionId": self.session_id,
++            "resumed": resumed,
++            "protocolVersion": self.protocol_version,
++            "agentInfo": self.agent_info,
++            "loadSession": bool(self.agent_capabilities.get("loadSession")),
++        }
++
++    def prompt(self, text, *, timeout=None):
++        """喂一轮话，等这一轮讲完；返回 {"stopReason": ...}。
++
++        timeout=None（默认）就一直等：一轮可能讲很久，进程一断 reader 线程会立刻
++        把等待者叫醒，不会真挂死。
++        """
++        if self.session_id is None:
++            raise AcpError("还没 start()，没有 sessionId")
++        params = {
++            "sessionId": self.session_id,
++            "prompt": [{"type": "text", "text": text}],
++        }
++        res = self._request("session/prompt", params, timeout=timeout)
++        if not isinstance(res, dict) or "stopReason" not in res:
++            raise AcpError(f"session/prompt 响应不合法（缺 stopReason）：{res!r}")
++        return res
++
++    def alive(self):
++        """进程还活着、且没 close() 过。"""
++        return (not self._closed) and self.proc is not None and self.proc.poll() is None
++
++    @property
++    def returncode(self):
++        """agent 进程的退出码：还在跑 / 没起过都给 None（打日志用）。"""
++        return None if self.proc is None else self.proc.poll()
++
++    def close(self):
++        """收掉 agent：关 stdin → terminate → 最多等 6s → kill。幂等。"""
++        with self._close_lock:
++            if self._closed:
++                return
++            self._closed = True
++            self._fail_all(AcpError("连接已关闭"))
++            proc = self.proc
++        if proc is None:
++            return
++
++        try:
++            if proc.stdin is not None:
++                proc.stdin.close()          # 先给个 EOF，让它自己体面地退
++        except Exception:
++            pass
++        try:
++            if proc.poll() is None:
++                proc.terminate()
++                try:
++                    proc.wait(timeout=6)
++                except subprocess.TimeoutExpired:
++                    proc.kill()
++                    try:
++                        proc.wait(timeout=2)
++                    except Exception:
++                        pass
++        except Exception as e:
++            self._log(f"收 agent 进程时出错（忽略）：{e!r}")
++        for stream in (proc.stdin, proc.stdout, proc.stderr):
++            try:
++                if stream is not None:
++                    stream.close()
++            except Exception:
++                pass
++
++    # ---------------------------------------------------------------- 内部
++
++    def _log(self, msg):
++        try:
++            self.on_log(msg)
++        except Exception:
++            pass
++
++    def _meta(self):
++        """人格正文挂在 params._meta.systemPrompt 上（字符串形态）；空就不挂。"""
++        if isinstance(self.system_prompt, str) and self.system_prompt != "":
++            return {"systemPrompt": self.system_prompt}
++        return None
++
++    def _spawn(self):
++        cmd = [self.bin_name] + list(self.argv)
++        env = dict(os.environ)
++        env.update(self.env)
++        try:
++            proc = subprocess.Popen(
++                cmd, cwd=self.cwd, env=env,
++                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                text=True, encoding="utf-8", errors="replace", bufsize=1)
++        except Exception as e:
++            raise AcpError(f"起不了 agent（{self.bin_name}）：{e}") from e
++        self.proc = proc
++        self._initialized = False
++        self._replay = False
++        self._dead = None
++        self.session_id = None
++        self.protocol_version = None
++        self.agent_info = None
++        self.agent_capabilities = {}
++        threading.Thread(target=self._reader, args=(proc,), daemon=True).start()
++        threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True).start()
++
++    def _initialize(self):
++        res = self._request("initialize", {
++            "protocolVersion": PROTOCOL_VERSION,
++            # 现拷一份：调用方改了常量也不该影响已经发出去的帧。
++            "clientCapabilities": {
++                "fs": dict(CLIENT_CAPABILITIES["fs"]),
++                "terminal": CLIENT_CAPABILITIES["terminal"],
++            },
++            "clientInfo": dict(self.CLIENT_INFO),
++        }, timeout=self.init_timeout)
++        if not isinstance(res, dict):
++            raise AcpError(f"initialize 响应不是对象：{res!r}")
++        got = res.get("protocolVersion")
++        if got != PROTOCOL_VERSION:
++            raise AcpError(f"该 agent 说的是 ACP v{got}，本客户端只认 "
++                           f"ACP v{PROTOCOL_VERSION}")
++        self.protocol_version = got
++        info = res.get("agentInfo")
++        self.agent_info = info if isinstance(info, dict) else None
++        caps = res.get("agentCapabilities")
++        self.agent_capabilities = caps if isinstance(caps, dict) else {}
++        self._initialized = True
++
++    def _alloc_id(self):
++        with self._id_lock:
++            rid = self._next_id
++            self._next_id += 1
++        return rid
++
++    def _request(self, method, params, timeout):
++        """发一个请求并等它的响应；超时 -> AcpTimeout，连接断/报错 -> AcpError。"""
++        if self._closed:
++            raise AcpError("连接已关闭")
++        rid = self._alloc_id()
++        slot = _Pending(method)
++        with self._pending_lock:
++            # 登记和「reader 是不是已经收摊」在同一把锁里判：reader 断线时也是拿着
++            # 这把锁扫在飞表，所以不会出现「登记完没人管、干等到超时」的空档。
++            if self._dead is not None:
++                raise AcpError(str(self._dead))
++            self._pending[rid] = slot      # 先登记再发，免得响应比登记还快
++        try:
++            self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
++        except Exception:
++            with self._pending_lock:
++                self._pending.pop(rid, None)
++            raise
++        if not slot.event.wait(timeout):
++            with self._pending_lock:
++                self._pending.pop(rid, None)
++            raise AcpTimeout(f"等 {method} 响应超时（{timeout}s）")
++        if slot.error is not None:
++            raise slot.error
++        return slot.result
++
++    def _send(self, frame):
++        """写一帧。JSON 里不会有裸换行（换行都被转义了），所以必然是「一行一帧」。"""
++        line = json.dumps(frame, ensure_ascii=False)
++        with self._write_lock:
++            proc = self.proc
++            if self._closed or proc is None or proc.stdin is None:
++                raise AcpError("连接已关闭")
++            try:
++                proc.stdin.write(line + "\n")
++                proc.stdin.flush()
++            except Exception as e:
++                raise AcpError(f"写 agent stdin 失败：{e}") from e
++
++    def _fail_all(self, err, *, dead=False):
++        """把所有等待者叫醒（各自一份异常对象，别共享 traceback）。
++
++        dead=True 表示管道断了：之后新发的请求一律直接失败，不许干等超时。
++        """
++        with self._pending_lock:
++            if dead:
++                self._dead = err
++            slots = list(self._pending.values())
++            self._pending.clear()
++        for slot in slots:
++            slot.error = AcpError(str(err))
++            slot.event.set()
++
++    # ---- 读侧：一条线程管 stdout ----
++
++    def _reader(self, proc):
++        try:
++            for line in proc.stdout:
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    obj = json.loads(line)
++                except Exception:
++                    # 垃圾行只记一笔：agent 的日志串到 stdout 是常事，不能因此断线。
++                    self._log(f"agent stdout 有非 JSON 行，跳过：{line[:200]}")
++                    continue
++                if not isinstance(obj, dict):
++                    self._log(f"agent stdout 有非对象帧，跳过：{line[:200]}")
++                    continue
++                try:
++                    self._dispatch(obj)
++                except Exception as e:
++                    self._log(f"处理 agent 帧出错（跳过）：{e!r}")
++        except Exception as e:
++            self._log(f"读 agent stdout 中断：{e!r}")
++        finally:
++            # 管道断了：在飞的请求全判失败，之后的新请求也直接失败，
++            # 别让调用方干等到超时才发现 agent 早没了。
++            self._fail_all(AcpError("agent 连接断了"), dead=True)
++
++    def _dispatch(self, obj):
++        method = obj.get("method")
++        rid = obj.get("id")
++        params = obj.get("params")
++        if not isinstance(params, dict):
++            params = {}
++        if method is not None:
++            if rid is not None:
++                self._on_agent_request(rid, method, params)     # agent -> 我们，要回
++            else:
++                self._on_notification(method, params)
++        elif rid is not None:
++            self._on_response(rid, obj)
++        else:
++            self._log(f"收到既无 method 也无 id 的帧，丢弃：{obj!r}")
++
++    def _on_response(self, rid, obj):
++        with self._pending_lock:
++            slot = self._pending.pop(rid, None)
++        if slot is None:
++            self._log(f"收到没有对应请求的响应，丢弃：id={rid}")
++            return
++        err = obj.get("error")
++        if err is not None:
++            code = err.get("code") if isinstance(err, dict) else None
++            msg = err.get("message") if isinstance(err, dict) else str(err)
++            slot.error = AcpError(f"{slot.method} 被 agent 拒了：code={code} message={msg}")
++        else:
++            slot.result = obj.get("result")
++        slot.event.set()
++
++    def _on_notification(self, method, params):
++        if method == "session/update":
++            update = params.get("update")
++            if not isinstance(update, dict):
++                self._log(f"session/update 没有 update 对象，跳过：{params!r}")
++                return
++            if self.on_update is not None:
++                try:
++                    self.on_update(params.get("sessionId"), update, self._replay)
++                except Exception as e:
++                    self._log(f"on_update 抛错（忽略）：{e!r}")
++        else:
++            self._log(f"没见过的通知，忽略：{method}")
++
++    def _on_agent_request(self, rid, method, params):
++        if method != "session/request_permission":
++            self._send({"jsonrpc": "2.0", "id": rid,
++                        "error": {"code": -32601, "message": f"method not found: {method}"}})
++            self._log(f"agent 请求了不认识的方法，已回 -32601：{method}")
++            return
++        tool_call = params.get("toolCall")
++        if not isinstance(tool_call, dict):
++            tool_call = {}
++        options = params.get("options")
++        if not isinstance(options, list):
++            options = []
++        outcome = self._decide(params.get("sessionId"), tool_call, options)
++        self._send({"jsonrpc": "2.0", "id": rid, "result": {"outcome": outcome}})
++
++    def _decide(self, session_id, tool_call, options):
++        """把 on_permission 的三态翻成 ACP 的 outcome。
++
++        allow/deny 都要挑一个 optionId 回给 agent；挑不到（没有对应 kind 的选项）
++        就退化成 cancelled——报「选了」但 id 是空的，agent 那边只会更糊涂。
++        """
++        if self.on_permission is None:
++            choice = "deny"                 # 没人接这个球：保守拒绝，别默认放行
++            self._log("没有 on_permission，按 deny 处理")
++        else:
++            try:
++                choice = self.on_permission(session_id, tool_call, options)
++            except Exception as e:
++                choice = "deny"
++                self._log(f"on_permission 抛错，按 deny 处理：{e!r}")
++        if choice not in ("allow", "deny", "cancel"):
++            self._log(f"on_permission 回了 {choice!r}，按 deny 处理")
++            choice = "deny"
++        if choice == "cancel":
++            return {"outcome": "cancelled"}
++        want = "allow" if choice == "allow" else "reject"
++        for opt in options:
++            if not isinstance(opt, dict):
++                continue
++            kind = opt.get("kind")
++            option_id = opt.get("optionId")
++            if isinstance(kind, str) and kind.startswith(want) and option_id:
++                return {"outcome": "selected", "optionId": option_id}
++        return {"outcome": "cancelled"}
++
++    def _drain_stderr(self, proc):
++        """agent 的日志（stderr）转到 on_log；不读会把管道塞满卡死对方。"""
++        try:
++            for line in proc.stderr:
++                line = line.rstrip()
++                if line:
++                    self._log(f"[agent] {line}")
++        except Exception:
++            pass
+diff --git a/driver.py b/driver.py
+index e8a1174..1db64e4 100644
+--- a/driver.py
++++ b/driver.py
+@@ -1,36 +1,218 @@
+ #!/usr/bin/env python3
+-"""讲课台 · 后端驱动器。
++"""讲课台 · 后端驱动器（ACP 版）。
+ 
+ 一个常驻进程管所有章，同一刻只醒一章（跟各课 state 的 live 走）：
+   · 盯 state/<course>.json 的 live：变到某章 → 拉起白砚；变空 → 收掉
+-  · 开过的章（sessions.json 有 sid）→ --resume 续上；没开过 → 起新的并塞一句交代
++  · 开过的章（sessions.json 有 sid）→ ACP session/load 续上；没开过 → session/new 并塞一句交代
+   · 网页新话落进 inbox.jsonl → 喂给当前白砚
+   · 白砚自己用讲课台接口（/api/append 等）写回讲稿，本驱动器不管它的输出内容
+ 
+-白砚 = 一个 claude -p 常驻子进程，stdin 走 stream-json 喂 user 消息，
+-        stdout 只看 system/init 拿 session_id 记档。
++白砚 = 一个由 TEACH_AGENT_BIN / TEACH_AGENT_ARGS 指定的、说 ACP 的常驻子进程
++（stdio 上的 JSON-RPC 2.0，v1；协议细节都在 acp.py 里）。
+ 
+-跑：   TEACH_BASE=http://127.0.0.1:8000 python3 driver.py
+-空跑： DRIVER_DRY=1 python3 driver.py        # 不动真进程，只打日志
++人格 prompts/白砚.md 默认走**系统提示通道**：acp.py 把全文挂在 session/new 与
++session/load 的 _meta.systemPrompt 上，绝不塞进第一句用户消息。通道由
++TEACH_AGENT_SYSTEM_PROMPT 选（meta 默认 / meta_append / args / both / none）。
++
++跑：   TEACH_AGENT_BIN=<你的 ACP agent> TEACH_BASE=http://127.0.0.1:8000 python3 driver.py
++空跑： TEACH_DRY=1 TEACH_AGENT_BIN=x python3 driver.py    # 不 spawn，只打命令/通道/三帧
+ """
+ import json
+ import os
++import re
++import shutil
+ import signal
+ import subprocess
++import sys
+ import threading
+ import time
+ import urllib.request
+ 
++try:
++    import acp
++except ImportError as _acp_err:      # acp.py 没落盘/没放对地方：先记下来，别在 import 就炸
++    acp, _ACP_ERROR = None, _acp_err
++else:
++    _ACP_ERROR = None
++
++# AcpClient 引进本模块命名空间：测试要换成假客户端时换 driver.AcpClient 就行，不用碰 acp.py。
++AcpClient = getattr(acp, "AcpClient", None)
++# 下面几个常量正常从 acp.py 取；它不在时给一份兜底，只为空跑预览还能把三帧打出来。
++PROTOCOL_VERSION = getattr(acp, "PROTOCOL_VERSION", 1)
++CLIENT_INFO = getattr(AcpClient, "CLIENT_INFO",
++                      {"name": "teach-platform", "title": "讲课台", "version": "0.2.0"})
++
+ ROOT = os.path.dirname(os.path.abspath(__file__))
+ STATE = os.path.join(ROOT, "state")
+ SESSIONS = os.path.join(STATE, "sessions.json")
+ INBOX = os.path.join(ROOT, "inbox.jsonl")
+-PROMPT_FILE = os.environ.get("TEACH_PROMPT", os.path.join(ROOT, "prompts", "白砚.md"))
++PROMPT_FILE = os.environ.get("TEACH_PROMPT") or os.path.join(ROOT, "prompts", "白砚.md")
++if not os.path.isabs(PROMPT_FILE):
++    PROMPT_FILE = os.path.join(ROOT, PROMPT_FILE)
+ LOG = os.path.join(ROOT, "driver.log")
+ BASE = os.environ.get("TEACH_BASE", "http://127.0.0.1:8000")
+-CLAUDE_BIN = os.environ.get("TEACH_CLAUDE_BIN", "claude")
+-DRY = os.environ.get("DRIVER_DRY") == "1"
+-POLL = float(os.environ.get("DRIVER_POLL", "2"))
++
++AGENT_INIT_TIMEOUT = 60.0   # 冷启动一个 agent 可能要装插件、拉配置，给足
++
++# clientCapabilities：acp.py 里有同名常量就优先用它，免得这里抄一份慢慢漂移。
++CLIENT_CAPABILITIES = getattr(acp, "CLIENT_CAPABILITIES", {
++    "fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False})
++
++
++class ConfigError(Exception):
++    """启动阶段的配置错误：报错后以 exit code 2 退出，不进主循环。"""
++
++
++# ---- agent 配置：起哪个 agent、带哪些 flag 全由环境变量决定 ----
++
++DEFAULT_AGENT_ARGS = ""
++PLACEHOLDERS = ("prompt", "prompt_file", "session")
++SYSTEM_PROMPT_MODES = ("meta", "meta_append", "args", "both", "none")
++PERMISSION_MODES = ("allow", "deny", "cancel")
++# 人格走 _meta 的三种取值（meta_append 的差别只在本侧日志里：acp.py 只收一个字符串）
++META_MODES = ("meta", "meta_append", "both")
++_KNOWN = "、".join("{" + p + "}" for p in PLACEHOLDERS)
++_BRACED = re.compile(r"\{([^{}]*)\}")
++
++
++class Config:
++    """一份算好的 agent 配置。
++
++    load_config() 造它、check_config() 校验它；字段都是死的，测试可以手搓一份坏的
++    直接喂 check_config，不必去动环境变量。
++    """
++
++    def __init__(self, bin="", args_raw=DEFAULT_AGENT_ARGS, system_prompt_mode="meta",
++                 permission="allow", log_updates=False, protocol="1", dry=False):
++        self.bin = bin                    # 环境变量里的原文（未解析）
++        self.bin_path = None              # resolve_bin 出来的路径；PATH 上找不到则 None
++        self.args_raw = args_raw          # 原始串（报错/日志要打原文）
++        self.arg_tokens = []              # split_args 切好的模板 token
++        self.system_prompt_mode = system_prompt_mode
++        self.permission = permission
++        self.log_updates = log_updates
++        self.protocol = protocol
++        # dry 放进 Config 是为了 check_config：空跑的意义就是不装 agent 也能验配置，
++        # 所以空跑时放行「PATH 上找不到程序」。
++        self.dry = dry
++
++
++def split_args(s):
++    """把 TEACH_AGENT_ARGS 切成一串 token。
++
++    按空白切分；成对的 " 把含空格的片段括成一项且引号本身去掉；
++    反斜杠不作转义（Windows 路径里的反斜杠原样保留，也不给空格转义）；
++    引号不配对 → ConfigError。
++    """
++    tokens = []
++    cur = []
++    started = False
++    in_quote = False
++    for ch in s:
++        if ch == '"':
++            in_quote = not in_quote
++            started = True
++        elif ch.isspace() and not in_quote:
++            if started:
++                tokens.append("".join(cur))
++                cur = []
++                started = False
++        else:
++            cur.append(ch)
++            started = True
++    if in_quote:
++        raise ConfigError(f"TEACH_AGENT_ARGS 里的引号不配对：{s}")
++    if started:
++        tokens.append("".join(cur))
++    return tokens
++
++
++def expand_args(tokens, *, prompt, prompt_file, session):
++    """展开 3 个占位符；其余 {xxx} 原样保留（启动时统一告警一次）。
++
++    {prompt} 展开成**一个** token：人格全文带空白也整块传，不按空白再切。
++    """
++    out = []
++    for tok in tokens:
++        if tok == "{prompt}":
++            out.append(prompt)
++        elif tok == "{prompt_file}":
++            out.append(prompt_file)
++        elif tok == "{session}":
++            out.append(session or "")
++        else:
++            out.append(tok)
++    return out
++
++
++def resolve_bin(name):
++    """PATH 上找可执行文件（Windows 认 PATHEXT：npm 装的 CLI 是 .CMD）；找不到给 None。"""
++    if not name:
++        return None
++    try:
++        return shutil.which(name)
++    except Exception:
++        return None
++
++
++def check_config(cfg):
++    """校验一份 Config：不合法 → ConfigError（main 捕获后打中文说明、exit 2）。
++
++    跟 load_config 分开，是为了能拿手搓的 Config 一条条单测失败分支。
++    """
++    if not cfg.bin:
++        raise ConfigError("TEACH_AGENT_BIN 没设：它必填，填 PATH 上的名字或绝对路径，"
++                          "例如 TEACH_AGENT_BIN=claude-code-acp（见 README「接一个 ACP 分身」）")
++    if any(c.isspace() for c in cfg.bin):
++        raise ConfigError(f"TEACH_AGENT_BIN={cfg.bin!r} 里有空白：BIN 只放程序本身"
++                          f"（PATH 上的名字或绝对路径），flag 一律放 TEACH_AGENT_ARGS")
++    if cfg.system_prompt_mode not in SYSTEM_PROMPT_MODES:
++        raise ConfigError(f"TEACH_AGENT_SYSTEM_PROMPT={cfg.system_prompt_mode!r} 不认："
++                          f"只能取 {'/'.join(SYSTEM_PROMPT_MODES)}")
++    if cfg.permission not in PERMISSION_MODES:
++        raise ConfigError(f"TEACH_AGENT_PERMISSION={cfg.permission!r} 不认："
++                          f"只能取 {'/'.join(PERMISSION_MODES)}")
++    if cfg.protocol != "1":
++        raise ConfigError(f"TEACH_AGENT_PROTOCOL={cfg.protocol!r} 不认：这一版只实现了 "
++                          f"ACP v1（TEACH_AGENT_PROTOCOL=1），v2 还没做")
++    if not cfg.bin_path and not cfg.dry:
++        raise ConfigError(f"PATH 上找不到 {cfg.bin!r}：确认装好了、名字没写错，或直接给绝对路径"
++                          f"（Windows 上 .cmd / .exe 都认）")
++    if AcpClient is None and not cfg.dry:
++        raise ConfigError(f"缺 acp.py（{_ACP_ERROR}）：它得跟 driver.py 放在同一个目录")
++    for tok in cfg.arg_tokens:
++        for name in _BRACED.findall(tok):
++            if name not in PLACEHOLDERS:
++                _warn_once(f"TEACH_AGENT_ARGS 里的 {{{name}}} 不认识，会原样传给 agent"
++                           f"（只有 {_KNOWN} 这 3 个会被展开）")
++
++
++def load_config(environ=os.environ):
++    """把环境变量读成一份 Config（纯函数：只读传入的字典，绝不碰 os.environ）。
++
++    驱动器启动时读一次，运行中改环境变量不生效，重启才生效。
++    """
++    cfg = Config(
++        bin=environ.get("TEACH_AGENT_BIN") or "",
++        args_raw=environ.get("TEACH_AGENT_ARGS", DEFAULT_AGENT_ARGS),
++        system_prompt_mode=(environ.get("TEACH_AGENT_SYSTEM_PROMPT") or "meta").strip(),
++        permission=(environ.get("TEACH_AGENT_PERMISSION") or "allow").strip(),
++        log_updates=(environ.get("TEACH_AGENT_LOG_UPDATES") or "0").strip() == "1",
++        protocol=(environ.get("TEACH_AGENT_PROTOCOL") or "1").strip(),
++        dry=read_dry(environ),
++    )
++    cfg.bin_path = resolve_bin(cfg.bin)
++    cfg.arg_tokens = split_args(cfg.args_raw)     # 引号不配对在这里就炸
++    check_config(cfg)
++    return cfg
++
++
++def describe_agent(cfg):
++    """启动时打一行配置，报错时方便对照。"""
++    bin_txt = cfg.bin_path or f"{cfg.bin}（PATH 上没找到）"
++    return (f"agent: bin={bin_txt} args={subprocess.list2cmdline(cfg.arg_tokens)} "
++            f"system_prompt={cfg.system_prompt_mode} permission={cfg.permission} "
++            f"log_updates={1 if cfg.log_updates else 0} protocol={cfg.protocol}")
+ 
+ 
+ def log(msg):
+@@ -46,6 +228,50 @@ def log(msg):
+         pass
+ 
+ 
++_WARNED = set()
++
++
++def _warn_once(msg):
++    if msg in _WARNED:
++        return
++    _WARNED.add(msg)
++    log(msg)
++
++
++def read_dry(environ=os.environ):
++    """TEACH_DRY=1 空跑；旧名字 DRIVER_DRY 兜底并告警一次（别让老脚本一升级就哑掉）。"""
++    raw = environ.get("TEACH_DRY")
++    if raw is None:
++        raw = environ.get("DRIVER_DRY")
++        if raw is not None:
++            _warn_once("DRIVER_DRY 改名叫 TEACH_DRY 了：这次仍按 DRIVER_DRY 生效，记得换过来")
++    return raw == "1"
++
++
++def read_poll(environ=os.environ):
++    """TEACH_POLL 秒数（默认 2）；旧名字 DRIVER_POLL 兜底并告警一次。写错退回 2。"""
++    raw = environ.get("TEACH_POLL")
++    if raw is None:
++        raw = environ.get("DRIVER_POLL")
++        if raw is not None:
++            _warn_once("DRIVER_POLL 改名叫 TEACH_POLL 了：这次仍按 DRIVER_POLL 生效，记得换过来")
++    if raw is None:
++        return 2.0
++    try:
++        poll = float(raw)
++    except ValueError:
++        _warn_once(f"TEACH_POLL={raw!r} 不是数字，按默认 2 秒走")
++        return 2.0
++    if poll <= 0:
++        _warn_once(f"TEACH_POLL={raw!r} 得是正数，按默认 2 秒走")
++        return 2.0
++    return poll
++
++
++DRY = read_dry()
++POLL = read_poll()
++
++
+ def load_json(path, default):
+     try:
+         with open(path, encoding="utf-8") as f:
+@@ -55,7 +281,7 @@ def load_json(path, default):
+ 
+ 
+ def current_live():
+-    """扫 state/*.json，返回 (course, chapter)；都空则 None。"""
++    """扫 state/*.json，返回 (course, chapter)；都空则 None（同一刻只认一章 live）。"""
+     try:
+         names = [n for n in os.listdir(STATE) if n.endswith(".json")]
+     except Exception:
+@@ -102,109 +328,215 @@ def register_sid(course, chapter, sid):
+         log(f"登记 sid 失败：{e}")
+ 
+ 
++def _chunk_text(update):
++    """agent_message_chunk 的正文：content 是一个 ContentBlock {"type":"text","text":...}。"""
++    content = update.get("content")
++    if isinstance(content, dict):
++        return (content.get("text") or "").strip()
++    if isinstance(content, str):
++        return content.strip()
++    return ""
++
++
++def dry_frames(cfg, sid, system_prompt, seed):
++    """空跑要打的三帧：initialize / session/new|load / session/prompt。
++
++    id 只是预览（真发时由 acp.py 自增）；目的是不装 agent 也能对着它的文档核对参数。
++    """
++    first = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
++             "params": {"protocolVersion": PROTOCOL_VERSION,
++                        "clientCapabilities": CLIENT_CAPABILITIES,
++                        "clientInfo": CLIENT_INFO}}
++    second_params = {"cwd": ROOT, "mcpServers": []}
++    if sid:
++        second_params = {"sessionId": sid, **second_params}
++    if system_prompt:
++        second_params["_meta"] = {"systemPrompt": system_prompt}
++    method = "session/load" if sid else "session/new"
++    second = {"jsonrpc": "2.0", "id": 2, "method": method, "params": second_params}
++    third = {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
++             "params": {"sessionId": sid or "<session/new 回的 id>",
++                        "prompt": [{"type": "text", "text": seed}]}}
++    return ((f"1 initialize", first), (f"2 {method}", second), ("3 session/prompt", third))
++
++
+ class Session:
+-    """一章一个白砚；completely 由驱动器起停。"""
++    """一章一个白砚：起停由驱动器管，说话走 acp.AcpClient。"""
+ 
+-    def __init__(self, course, chapter):
++    def __init__(self, course, chapter, cfg):
+         self.course = course
+         self.chapter = chapter
+-        self.proc = None
++        self.cfg = cfg
++        self.client = None
++        self.argv = None            # 展开后的完整命令（起点失败时要打出来）
++        self.prompt_text = ""       # 人格全文
+         self.sid = None
+         self.fed = 0
+-        self.lock = threading.Lock()
++
++    # ---- 人格：一个来源，三条通道 ----
++    def _system_prompt(self):
++        """给 acp.py 的人格文本（它挂到 _meta.systemPrompt）；不走 meta 通道时给 None。"""
++        if self.cfg.system_prompt_mode in META_MODES:
++            return self.prompt_text
++        return None
++
++    def _prompt_via_args(self):
++        """{prompt} 展开成什么：走 argv 通道给全文，否则给空串——同一份人格不能两条路各灌一遍。"""
++        return self.prompt_text if self.cfg.system_prompt_mode in ("args", "both") else ""
++
++    def _prompt_file_via_args(self):
++        """{prompt_file} 同理：不走 argv 通道时给空串（文件路径也算人格那条路）。"""
++        return PROMPT_FILE if self.cfg.system_prompt_mode in ("args", "both") else ""
++
++    def _argv(self, sid):
++        """展开后的完整命令：真起和空跑共用一份，免得两边对不上。"""
++        return [self.cfg.bin_path or self.cfg.bin] + expand_args(
++            self.cfg.arg_tokens, prompt=self._prompt_via_args(),
++            prompt_file=self._prompt_file_via_args(), session=str(sid) if sid else "")
+ 
+     # ---- 起 ----
+     def start(self):
+-        sid = session_of(self.course, self.chapter)
++        """起白砚：读人格 → 算开场交代 → 开/续 ACP 会话（空跑只打日志）。"""
++        old_sid = session_of(self.course, self.chapter)
+         try:
+             with open(PROMPT_FILE, encoding="utf-8") as f:
+-                prompt = f.read()
++                self.prompt_text = f.read()
+         except Exception as e:
+             log(f"读白砚提示词失败：{e}")
+-            prompt = ""
+-
+-        args = [CLAUDE_BIN, "-p",
+-                "--input-format", "stream-json",
+-                "--output-format", "stream-json",
+-                "--verbose", "--dangerously-skip-permissions",
+-                "--append-system-prompt", prompt]
+-        if sid:
+-            args += ["--resume", sid]
+-
+-        if DRY:
+-            log(f"[DRY] 会起白砚：{self.course} 第{self.chapter}章 "
+-                f"{'续 ' + sid if sid else '新开'}")
+-            self.sid = sid or "(dry)"
+-            self.fed = self._inbox_len()
++            self.prompt_text = ""
++
++        if self.cfg.dry:
++            self._dry_report(old_sid, self._seed(old_sid))
++            self.sid = old_sid or "(dry)"
++            self.fed = self._inbox_len()    # 空跑也别把开讲前的旧 inbox 重喂
+             return
+ 
+-        log(f"起白砚：{self.course} 第{self.chapter}章 {'续 ' + sid if sid else '新开'}")
+-        env = dict(os.environ, TEACH_DRIVER="1")
+-        self.proc = subprocess.Popen(
+-            args, cwd=ROOT, env=env, stdin=subprocess.PIPE,
+-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+-        threading.Thread(target=self._read_stdout, daemon=True).start()
+-        threading.Thread(target=self._drain_stderr, daemon=True).start()
++        info = self._open(old_sid)
++        self.sid = info.get("sessionId") or ""
++        # 交代按**真正建立起来的**会话算：旧会话没续上就落成新会话，话术也得跟着换，
++        # 否则新会话里的白砚会以为上下文还在。
++        resumed = bool(old_sid) and bool(info.get("resumed"))
++        log(f"白砚 session={self.sid}（{self.course} 第{self.chapter}章"
++            f"{'，续上旧会话' if resumed else ''}）")
++        if self.sid:
++            register_sid(self.course, self.chapter, self.sid)
++        self.feed(self._seed(old_sid if resumed else None))
++        self.fed = self._inbox_len()        # 别把开讲前的旧 inbox 重喂
++
++    def _spawn(self, sid, *, load):
++        """起一个 ACP 客户端：sid 非空且 load 走 session/load，否则 session/new。"""
++        argv = self._argv(sid)
++        self.argv = argv
++        client = AcpClient(argv[0], argv[1:], cwd=ROOT,
++                           env=dict(os.environ, TEACH_DRIVER="1"),
++                           system_prompt=self._system_prompt(),
++                           on_permission=self._on_permission,
++                           on_update=self._on_update,
++                           on_log=self._agent_log,
++                           init_timeout=AGENT_INIT_TIMEOUT)
++        self.client = client
++        return client.start(session_id=sid if load else None, load_session=load)
++
++    def _open(self, old_sid):
++        """开/续会话。续不上不算启动失败——丢掉旧 sid、重开一个新会话接着讲。
++
++        acp.py 的约定：session/load 被 agent 拒了（多半是它不支持 session/load）
++        就抛 AcpError，所以这一支同时盖住「agent 不支持」和「旧会话在对面没了」。
++        换个进程起新会话（而不是在同一个 client 上再 start 一次）：argv 要按新
++        session 重新展开，旧 client 的命令行里还留着旧 sid。
++        """
++        if old_sid:
++            try:
++                return self._spawn(old_sid, load=True)
++            except Exception as e:
++                log(f"旧会话 {old_sid} 无法续（{_exc_text(e)}；agent 可能不支持 "
++                    f"session/load），另开新会话")
++                self._close_client()
++        return self._spawn(None, load=False)
++
++    def _close_client(self):
++        client, self.client = self.client, None
++        if client is None:
++            return
++        try:
++            client.close()
++        except Exception as e:
++            log(f"收白砚出错：{_exc_text(e)}")
+ 
++    def _seed(self, old_sid):
++        """开场交代：续会话/新会话两套话术，都是**普通用户消息**（人格不走这里）。"""
+         meta = chapter_meta(self.course, self.chapter)
+-        title = meta.get("chapter_title", "")
+-        if sid:
+-            seed = (f"学生回到讲课台了（还是《{meta.get('course_title')}》"
++        title = meta.get("chapter_title") or "（未命名）"
++        course_title = meta.get("course_title") or "（未命名课程）"
++        if old_sid:
++            return (f"学生回到讲课台了（还是《{course_title}》"
+                     f"第{self.chapter}章「{title}」）。接着上次讲——先 `GET {BASE}/api/inbox"
+                     f"?course={self.course}` 看看他最后说了什么，再决定开口说什么。")
+-        else:
+-            seed = (f"学生刚在讲课台唤醒了《{meta.get('course_title')}》第{self.chapter}章"
+-                    f"「{title}」，从书页 {meta.get('book_page')}（PDF {meta.get('page')}）起。"
+-                    f"你是白砚，去开讲：先 `GET {BASE}/api/state?course={self.course}` 看眼当前讲稿"
+-                    f"（markdown 字段）——已有内容就接着往下讲、别重来；还空着就写一段开场白。"
+-                    f"动笔前可跑 `python3 teach.py view {self.course}` 看当前页（图用 Read 打开）。"
+-                    f"输出一律走 POST /api/append 追加。别一次讲太多，讲完停下等他。")
+-        self.feed(seed)
+-        self.fed = self._inbox_len()   # 别把开讲前的旧 inbox 重喂
+-
+-    # ---- 读 ----
+-    def _read_stdout(self):
+-        try:
+-            for line in self.proc.stdout:
+-                line = line.strip()
+-                if not line:
+-                    continue
+-                try:
+-                    obj = json.loads(line)
+-                except Exception:
+-                    continue
+-                t = obj.get("type")
+-                if t == "system" and obj.get("subtype") == "init" and obj.get("session_id"):
+-                    self.sid = obj["session_id"]
+-                    register_sid(self.course, self.chapter, self.sid)
+-                    log(f"白砚 session={self.sid}")
+-                elif t == "result":
+-                    log("白砚一轮结束")
+-        except Exception:
+-            pass
+-
+-    def _drain_stderr(self):
+-        try:
+-            for line in self.proc.stderr:
+-                log(f"[白砚] {line.rstrip()}")
+-        except Exception:
+-            pass
++        where = (f"从书页 {meta.get('book_page')}（PDF {meta.get('page')}）起"
++                 if meta.get("page") else "从本章起始页起（讲课台没回应，页号自己查）")
++        return (f"学生刚在讲课台唤醒了《{course_title}》第{self.chapter}章「{title}」，{where}。"
++                f"你是白砚，去开讲：先 `GET {BASE}/api/state?course={self.course}` 看眼当前讲稿"
++                f"（markdown 字段）——已有内容就接着往下讲、别重来；还空着就写一段开场白。"
++                f"动笔前可跑 `python3 teach.py view {self.course}` 看当前页"
++                f"（它会给出那页的图和文字，图直接打开看）。"
++                f"输出一律走 POST /api/append 追加。别一次讲太多，讲完停下等他。")
++
++    def _dry_report(self, old_sid, seed):
++        """空跑：把会执行的命令、人格走的通道、将要发的三帧全打出来（不 spawn）。"""
++        argv = self._argv(old_sid)
++        self.argv = argv
++        log(f"[DRY] 会起白砚：{self.course} 第{self.chapter}章 "
++            f"{'续 ' + old_sid if old_sid else '新开'}（不 spawn）")
++        log(f"[DRY] 会执行：{subprocess.list2cmdline(argv)}")
++        log(f"[DRY] cwd={ROOT}")
++        log(f"[DRY] system_prompt channel={self.cfg.system_prompt_mode} "
++            f"meta_bytes={len(self._system_prompt() or '')} "
++            f"argv_prompt={'是' if self._prompt_via_args() else '否'}")
++        log(f"[DRY] clientCapabilities={json.dumps(CLIENT_CAPABILITIES, ensure_ascii=False)}")
++        for label, frame in dry_frames(self.cfg, old_sid, self._system_prompt(), seed):
++            log(f"[DRY] 帧·{label}：{json.dumps(frame, ensure_ascii=False)}")
++        log("[DRY] 第一句 prompt 全文：\n" + seed)
++
++    # ---- 白砚那边来的消息 ----
++    def _on_permission(self, sid, tool_call, options):
++        """权限一律按配置回（默认 allow）：白砚开白板、翻页时没人守在终端前点确认。"""
++        tc = tool_call or {}
++        title = tc.get("title") or tc.get("toolCallId") or "工具"
++        log(f"[白砚权限] {title} → {self.cfg.permission}")
++        return self.cfg.permission
++
++    def _on_update(self, sid, update, replay):
++        """只记日志，绝不往讲稿写东西——讲稿是白砚自己 POST /api/append 的事。"""
++        up = update or {}
++        kind = up.get("sessionUpdate")
++        if kind == "tool_call":
++            title = up.get("title") or up.get("toolCallId") or "?"
++            log(f"[白砚工具] {title} ({up.get('kind')}/{up.get('status')})")
++        elif kind == "agent_message_chunk" and self.cfg.log_updates:
++            text = _chunk_text(up)
++            if text:
++                log(f"[白砚说] {text[:200]}")
++        # 其余变体（plan / usage_update / tool_call_update…）忽略：驱动不替白砚记讲稿
++
++    def _agent_log(self, line):
++        log(f"[白砚日志] {line}")
+ 
+     # ---- 喂 ----
+     def feed(self, text):
+-        with self.lock:
+-            if DRY or not self.proc or not self.proc.stdin:
+-                log(f"[DRY] 喂白砚：{text[:100]}")
+-                return
+-            line = json.dumps({"type": "user",
+-                               "message": {"role": "user",
+-                                           "content": [{"type": "text", "text": text}]}})
+-            try:
+-                self.proc.stdin.write(line + "\n")
+-                self.proc.stdin.flush()
+-                log(f"喂白砚：{text[:100]}")
+-            except Exception as e:
+-                log(f"喂白砚失败：{e}")
++        """发一句 session/prompt：一条 daemon 线程，一轮可能讲很久，不能卡住 2 秒的 poll 循环。"""
++        if self.cfg.dry or not self.client:
++            log(f"[DRY] 喂白砚：{text[:100]}")
++            return
++        log(f"喂白砚：{text[:100]}")
++        threading.Thread(target=self._prompt_once, args=(text,), daemon=True).start()
++
++    def _prompt_once(self, text):
++        client = self.client
++        try:
++            res = client.prompt(text)
++            log(f"白砚一轮结束（stopReason={res.get('stopReason')}）")
++        except Exception as e:
++            log(f"喂白砚失败：{_exc_text(e)}")
+ 
+     def _inbox_len(self):
+         try:
+@@ -233,31 +565,35 @@ class Session:
+             imgs = [im.get("path") for im in (rec.get("images") or []) if im.get("path")]
+             msg = f"学生：{text}" if text else "学生：（只发了图）"
+             if imgs:
+-                msg += "\n（他附了图：" + "、".join(imgs) + "，用 Read 打开看）"
++                msg += "\n（他附了图：" + "、".join(imgs) + "，打开那张图看）"
+             self.feed(msg)
+         self.fed = len(lines)
+ 
+     # ---- 收 ----
++    def alive(self):
++        if self.cfg.dry:
++            return True       # 空跑没有真进程：当作活着，别让主循环把空跑的会话收掉
++        return bool(self.client) and self.client.alive()
++
++    def exit_code(self):
++        """进程退出码：acp.py 有 returncode 就用它，没有就退回 proc.poll()（都没有给 None）。"""
++        client = self.client
++        code = getattr(client, "returncode", None)
++        if code is None:
++            code = getattr(getattr(client, "proc", None), "returncode", None)
++        return code
++
+     def stop(self):
+-        p = self.proc
+-        if DRY:
++        if self.cfg.dry:
+             log("[DRY] 收白砚")
+             return
+-        if not p:
++        if self.client is None:
+             return
+         log(f"收白砚：{self.course} 第{self.chapter}章")
+-        try:
+-            p.terminate()
+-            try:
+-                p.wait(timeout=6)
+-            except subprocess.TimeoutExpired:
+-                p.kill()
+-        except Exception:
+-            pass
+-        self.proc = None
++        self._close_client()
+ 
+ 
+-G = {"target": None, "sess": None}
++G = {"target": None, "sess": None, "dead": None}
+ 
+ 
+ def _on_signal(sig, _frm):
+@@ -267,23 +603,95 @@ def _on_signal(sig, _frm):
+     os._exit(0)
+ 
+ 
+-def main():
++def _exc_text(e):
++    code = getattr(e, "winerror", None)
++    txt = str(e)
++    if code and f"WinError {code}" not in txt:
++        txt = f"{txt}（WinError {code}）"
++    return f"{type(e).__name__}: {txt}"
++
++
++def _start_hint(e):
++    """按异常类型补一句能照做的提示。"""
++    code = getattr(e, "winerror", None)
++    if code == 193:
++        return "提示：WinError 193 = 这份文件不能直接执行——别指 .ps1，用 .cmd / .exe。"
++    if code == 2 or isinstance(e, FileNotFoundError):
++        return ("提示：BIN 只放程序本身（PATH 上的名字或绝对路径），全部 flag 放 "
++                "TEACH_AGENT_ARGS；填了整条带空格的命令就会这样。")
++    return ("提示：用 TEACH_DRY=1 打一份会执行的命令与三帧 JSON 核对；"
++            "agent 说什么协议由它自己负责。")
++
++
++def tick(cfg):
++    """主循环的一拍：看 live 起停白砚、把新话喂进去。抽成函数是为了能单测。"""
++    live = current_live()
++    if live != G["target"]:
++        log(f"live 变：{G['target']} → {live}")
++        if G["sess"]:
++            G["sess"].stop()
++            G["sess"] = None
++        G["target"] = live
++        if not live:
++            G["dead"] = None     # 台子空了：清掉「不再重试」的记号，下次唤醒是全新一轮
++        elif live == G["dead"]:
++            log(f"这一章这一轮已经停过（{live[0]} 第{live[1]}章）：不自动重试，"
++                f"改好配置后重新唤醒本章")
++        else:
++            sess = Session(live[0], live[1], cfg)
++            try:
++                sess.start()
++                G["sess"] = sess
++            except Exception as e:
++                G["sess"] = None
++                log(f"起白砚失败（{live[0]} 第{live[1]}章）：{_exc_text(e)}")
++                if sess.argv:
++                    log(f"展开后命令：{subprocess.list2cmdline(sess.argv)}")
++                log(_start_hint(e))
++                log("这一章先不动了——改好配置后重新唤醒本章（不会每 2 秒重试）")
++                try:
++                    sess.stop()
++                except Exception:
++                    pass
++                G["dead"] = live
++    if G["sess"]:
++        if not G["sess"].alive():
++            code = G["sess"].exit_code()
++            log(f"白砚进程已退出（exit code {code if code is not None else '未知'}），本章先停")
++            try:
++                G["sess"].stop()
++            except Exception:
++                pass
++            G["dead"] = G["target"]     # 记住这一章：同一 live 不重试风暴
++            G["sess"] = None
++            G["target"] = None          # 状态机回 idle，等下一次 live 变化
++        else:
++            G["sess"].poll_inbox()
++
++
++def main(environ=os.environ):
++    try:
++        cfg = load_config(environ)
++    except ConfigError as e:
++        log(f"配置错误：{e}")
++        log("驱动器不启动。改好环境变量后重跑 python3 driver.py")
++        sys.exit(2)
++
+     signal.signal(signal.SIGTERM, _on_signal)
+     signal.signal(signal.SIGINT, _on_signal)
+     log(f"驱动器启动 | base={BASE} dry={DRY} poll={POLL}s")
++    log(describe_agent(cfg))
++    if cfg.dry and current_live() is None:
++        # 空跑的意义是「不装 agent 也能把配置看全」：还没唤醒任何章时用示例章节把同一条
++        # start() 路径走一遍（DRY 分支只打日志），免得空跑什么都不显示。
++        log("[DRY] 现在没有 live 章节：下面用示例章节「(dry) 第1章」预览；"
++            "唤醒某章后，空跑看的就是那一章")
++        try:
++            Session("(dry)", "1", cfg).start()
++        except Exception as e:
++            log(f"[DRY] 预览失败：{_exc_text(e)}")
+     while True:
+-        live = current_live()
+-        if live != G["target"]:
+-            log(f"live 变：{G['target']} → {live}")
+-            if G["sess"]:
+-                G["sess"].stop()
+-                G["sess"] = None
+-            G["target"] = live
+-            if live:
+-                G["sess"] = Session(*live)
+-                G["sess"].start()
+-        if G["sess"]:
+-            G["sess"].poll_inbox()
++        tick(cfg)
+         time.sleep(POLL)
+ 
+ 
+diff --git a/requirements.txt b/requirements.txt
+index 1731c7a..a1c65a6 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,4 +2,4 @@
+ # 运行只需 Python 3 标准库，无 pip 依赖。
+ # 系统级额外需要：
+ #   · poppler（pdftoppm / pdftotext）—— 把课本 PDF 渲成图、抽文字层
+-#   · 一个讲课分身 CLI —— 默认是 claude，可用环境变量 TEACH_CLAUDE_BIN 换成别的
++#   · 一个讲课分身 CLI —— 由环境变量 TEACH_AGENT_BIN 指定的任意 ACP agent
+diff --git a/tests/test_acp_agent_stub.py b/tests/test_acp_agent_stub.py
+new file mode 100644
+index 0000000..a6eaa31
+--- /dev/null
++++ b/tests/test_acp_agent_stub.py
+@@ -0,0 +1,322 @@
++#!/usr/bin/env python3
++"""ACP 测试用 stub agent：纯标准库、可直接执行。
++
++被 [sys.executable, 本文件] 拉起。默认是个很乖的「讲课台 agent」：
++initialize 报 v1 + 能力，session/new|load 给 sess-stub，session/prompt 先喷一串
++session/update（agent_message_chunk / tool_call / tool_call_update / plan），
++再按 STUB_ASK_PERMISSION 决定要不要请求一次权限，最后回 end_turn。
++
++环境变量（全部可选）：
++  STUB_PROTOCOL_VERSION       默认 1    initialize 回的版本号（测版本不符）
++  STUB_LOAD_SESSION           默认 0    init 里 loadSession 能力真假
++  STUB_EXIT_AFTER_INIT        默认 0    1 = 回完 initialize 立刻退出
++  STUB_SILENT                 默认 0    1 = 什么都不回（测超时）
++  STUB_ASK_PERMISSION         默认 1    prompt 时先发 session/request_permission
++  STUB_PERMISSION_OPTIONS     默认 normal  normal | none | allow-only
++                                        （后两个测「没有可选 option」的退化）
++  STUB_GARBAGE_LINES          默认 0    每次响应前先往 stdout 写 N 行非 JSON
++  STUB_REQUIRE_SYSTEM_PROMPT  默认 0    1 = 缺人格就报错 exit 3（反向锁）
++  STUB_USAGE                  默认 0    1 = 多插一帧 usage_update
++  STUB_FAIL_LOAD              默认 0    1 = session/load 回 JSON-RPC error
++                                        （测「error 响应 -> AcpError」与失败后能否重来）
++  STUB_UNKNOWN_REQUEST        默认 0    1 = prompt 时发一个未知方法请求，等客户端
++                                        回错再收尾（测 -32601）
++  STUB_ECHO_PROMPT            默认 0    1 = 在 prompt 结果里带回收到的文本
++                                        （测并发 prompt 按 id 配对）
++  STUB_PROMPT_BARRIER         默认 0    N>1 时攒够 N 个 session/prompt 才一起回，
++                                        且倒着回（测两个 prompt 真同时在飞）
++  STUB_RECORD                          文件路径：收到的每一帧原始 JSON 逐行追加
++  STUB_LOG                             文件路径：调试日志
++
++所有等待都有秒级上限（READ_TIMEOUT），测试宁可失败也不能挂死。
++"""
++import json
++import os
++import queue
++import sys
++import threading
++
++READ_TIMEOUT = 10.0
++SESSION_ID = "sess-stub"
++PROMPT_ID_BASE = 9000          # stub 自己发请求用的 id，跟客户端的 1..N 错开
++TOOL_CALL = {"toolCallId": "call-1", "title": "读一下教材", "kind": "read"}
++PERMISSION_OPTIONS = {
++    "normal": [
++        {"optionId": "allow-once", "name": "允许一次", "kind": "allow_once"},
++        {"optionId": "reject-once", "name": "拒绝一次", "kind": "reject_once"},
++        {"optionId": "allow-always", "name": "总是允许", "kind": "allow_always"},
++    ],
++    "none": [],
++    "allow-only": [
++        {"optionId": "allow-once", "name": "允许一次", "kind": "allow_once"},
++    ],
++}
++UPDATES = ("agent_message_chunk", "tool_call", "tool_call_update", "plan")
++
++
++def env(name, default=""):
++    """读环境变量；没设或设成空串都算没设。"""
++    value = os.environ.get(name)
++    return default if value is None or value == "" else value
++
++
++def env_int(name, default):
++    try:
++        return int(env(name, str(default)))
++    except ValueError:
++        return default
++
++
++def fix_encoding():
++    """管道默认跟 Windows ANSI 代码页走，协议要求 UTF-8；顺手把换行锁成 \n。"""
++    for stream, kw in ((sys.stdin, {"encoding": "utf-8"}),
++                       (sys.stdout, {"encoding": "utf-8", "newline": "\n"}),
++                       (sys.stderr, {"encoding": "utf-8", "errors": "replace"})):
++        try:
++            stream.reconfigure(**kw)
++        except Exception:
++            pass
++
++
++def log(msg):
++    path = os.environ.get("STUB_LOG")
++    if not path:
++        return
++    try:
++        with open(path, "a", encoding="utf-8") as f:
++            f.write(str(msg) + "\n")
++    except Exception:
++        pass
++
++
++_RECORD_WARNED = []
++
++
++def record(raw):
++    """把收到的一帧原样追加下来，测试拿它断言客户端到底发了什么。"""
++    path = os.environ.get("STUB_RECORD")
++    if not path:
++        return
++    try:
++        with open(path, "a", encoding="utf-8") as f:
++            f.write(raw + "\n")
++    except Exception as e:
++        # 记不了帧不能让 agent 死，但必须吼一声：不然测试只看到「记录是空的」。
++        if not _RECORD_WARNED:
++            _RECORD_WARNED.append(True)
++            sys.stderr.write(f"stub: STUB_RECORD 写不了（{path}）：{e!r}\n")
++            sys.stderr.flush()
++
++
++class Stub:
++    def __init__(self):
++        self.protocol_version = env_int("STUB_PROTOCOL_VERSION", 1)
++        self.load_session = env("STUB_LOAD_SESSION") == "1"
++        self.exit_after_init = env("STUB_EXIT_AFTER_INIT") == "1"
++        self.ask_permission = env("STUB_ASK_PERMISSION", "1") == "1"
++        self.permission_options = PERMISSION_OPTIONS.get(
++            env("STUB_PERMISSION_OPTIONS", "normal"), PERMISSION_OPTIONS["normal"])
++        self.garbage = env_int("STUB_GARBAGE_LINES", 0)
++        self.require_system_prompt = env("STUB_REQUIRE_SYSTEM_PROMPT") == "1"
++        self.usage = env("STUB_USAGE") == "1"
++        self.fail_load = env("STUB_FAIL_LOAD") == "1"
++        self.unknown_request = env("STUB_UNKNOWN_REQUEST") == "1"
++        self.echo_prompt = env("STUB_ECHO_PROMPT") == "1"
++        self.barrier = env_int("STUB_PROMPT_BARRIER", 0)
++
++        self.next_id = PROMPT_ID_BASE
++        self.ready = {}          # prompt 请求 id -> 收到的文本
++        self.blocked = {}        # prompt 请求 id -> 还欠几个响应
++        self.pending = {}        # 我发出的请求 id -> 对应哪个 prompt
++
++    # ---- 发 ----
++
++    def write(self, frame):
++        sys.stdout.write(json.dumps(frame, ensure_ascii=False) + "\n")
++        sys.stdout.flush()
++
++    def notify(self, method, params):
++        self.write({"jsonrpc": "2.0", "method": method, "params": params})
++
++    def request(self, method, params):
++        rid = self.next_id
++        self.next_id += 1
++        self.write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
++        return rid
++
++    def garbage_lines(self):
++        for i in range(self.garbage):
++            sys.stdout.write(f"这不是 JSON 行 #{i + 1}\n")
++        sys.stdout.flush()
++
++    def respond(self, rid, result):
++        self.garbage_lines()             # 垃圾行在响应之前：测「脏 stdout 不致命」
++        self.write({"jsonrpc": "2.0", "id": rid, "result": result})
++
++    def respond_error(self, rid, code, message):
++        self.garbage_lines()
++        self.write({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}})
++
++    def update(self, session_id, name, **extra):
++        # 形参别叫 kind：update 体里本来就有 kind 字段（tool_call 用），会撞名。
++        body = {"sessionUpdate": name}
++        body.update(extra)
++        self.notify("session/update", {"sessionId": session_id, "update": body})
++
++    # ---- 收 ----
++
++    def handle(self, frame):
++        method = frame.get("method")
++        rid = frame.get("id")
++        params = frame.get("params")
++        if not isinstance(params, dict):
++            params = {}
++        if method == "initialize":
++            self.on_initialize(rid, params)
++        elif method in ("session/new", "session/load"):
++            self.on_session(method, rid, params)
++        elif method == "session/prompt":
++            self.on_prompt(rid, params)
++        elif method is not None:
++            log(f"客户端来了没见过的请求：{method}")
++            self.respond_error(rid, -32601, f"method not found: {method}")
++        elif rid is not None:
++            self.on_response(rid, frame)
++        else:
++            log(f"既无 method 也无 id 的帧，丢弃：{frame!r}")
++
++    def on_initialize(self, rid, params):
++        self.respond(rid, {
++            "protocolVersion": self.protocol_version,
++            "agentCapabilities": {
++                "loadSession": self.load_session,
++                "promptCapabilities": {"image": False, "audio": False, "embeddedContext": False},
++            },
++            "agentInfo": {"name": "stub-acp", "version": "0.0.1"},
++            "authMethods": [],
++        })
++        if self.exit_after_init:
++            log("按 STUB_EXIT_AFTER_INIT 退出")
++            sys.exit(0)
++
++    def on_session(self, method, rid, params):
++        if self.require_system_prompt:
++            prompt = (params.get("_meta") or {}).get("systemPrompt")
++            if not isinstance(prompt, str) or prompt == "":
++                sys.stderr.write("stub: session 请求里没有非空字符串 _meta.systemPrompt，"
++                                 "驱动器没把人格发出来\n")
++                sys.stderr.flush()
++                sys.exit(3)
++        if method == "session/load" and self.fail_load:
++            self.respond_error(rid, -32600, "session/load 失败（stub 故意）")
++            return
++        if method == "session/load":
++            # 回响应之前先重放历史：客户端的 replay 窗口要盖住这几帧。
++            session_id = params.get("sessionId")
++            for i in (1, 2):
++                self.update(session_id, "agent_message_chunk",
++                            content={"type": "text", "text": f"历史重放 {i}"})
++            self.respond(rid, {})
++        else:
++            self.respond(rid, {"sessionId": SESSION_ID})
++
++    def on_prompt(self, rid, params):
++        session_id = params.get("sessionId")
++        items = params.get("prompt")
++        text = ""
++        if isinstance(items, list) and items and isinstance(items[0], dict):
++            text = items[0].get("text") or ""
++        self.update(session_id, "agent_message_chunk",
++                    content={"type": "text", "text": f"收到：{text}"})
++        self.update(session_id, "tool_call", toolCallId=TOOL_CALL["toolCallId"],
++                    title=TOOL_CALL["title"], kind=TOOL_CALL["kind"], status="pending")
++        self.update(session_id, "tool_call_update", toolCallId=TOOL_CALL["toolCallId"],
++                    status="completed")
++        self.update(session_id, "plan", entries=[{"content": "讲一段", "status": "completed"}])
++        if self.usage:
++            self.update(session_id, "usage_update", used=123, size=1000)
++
++        self.ready[rid] = text
++        self.blocked[rid] = 0
++        if self.ask_permission:
++            self.blocked[rid] += 1
++            self.pending[self.request("session/request_permission", {
++                "sessionId": session_id,
++                "toolCall": dict(TOOL_CALL),
++                "options": [dict(o) for o in self.permission_options],
++            })] = rid
++        if self.unknown_request:
++            self.blocked[rid] += 1
++            self.pending[self.request("session/unknown_thing", {"sessionId": session_id})] = rid
++        self.maybe_finish()
++
++    def on_response(self, rid, frame):
++        prompt_id = self.pending.pop(rid, None)
++        if prompt_id is None:
++            log(f"收到没登记的响应 id={rid}")
++            return
++        log(f"响应 id={rid} -> prompt {prompt_id}：{frame.get('result') or frame.get('error')}")
++        self.blocked[prompt_id] = max(0, self.blocked.get(prompt_id, 0) - 1)
++        self.maybe_finish()
++
++    def maybe_finish(self):
++        """所有欠账都清了才收尾；barrier>1 时先攒够 N 个 prompt（测并发）。"""
++        if self.barrier > 1 and len(self.ready) < self.barrier:
++            return
++        done = sorted([rid for rid, n in self.blocked.items() if n == 0], reverse=True)
++        for rid in done:
++            result = {"stopReason": "end_turn"}
++            if self.echo_prompt:
++                result["promptText"] = self.ready.pop(rid)
++            else:
++                self.ready.pop(rid, None)
++            self.blocked.pop(rid, None)
++            self.respond(rid, result)
++
++
++def pump_stdin(q):
++    try:
++        for line in sys.stdin:
++            q.put(line)
++    except Exception:
++        pass
++    q.put(None)          # EOF：主循环收到就退
++
++
++def main():
++    fix_encoding()
++    if os.environ.get("STUB_SILENT") == "1":
++        # 一个字都不回：客户端靠超时收场，测试关 stdin 后我们退。
++        for _ in sys.stdin:
++            pass
++        return 0
++    log("stub 起来")
++    q = queue.Queue()
++    threading.Thread(target=pump_stdin, args=(q,), daemon=True).start()
++    stub = Stub()
++    while True:
++        try:
++            line = q.get(timeout=READ_TIMEOUT)
++        except queue.Empty:
++            log(f"等客户端帧超过 {READ_TIMEOUT}s，退出")
++            return 0
++        if line is None:
++            log("stdin EOF，退出")
++            return 0
++        line = line.strip()
++        if not line:
++            continue
++        record(line)
++        try:
++            frame = json.loads(line)
++        except Exception:
++            log(f"收到非 JSON 帧，跳过：{line[:120]}")
++            continue
++        if isinstance(frame, dict):
++            stub.handle(frame)
++        else:
++            log(f"收到非对象帧，跳过：{line[:120]}")
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/test_acp_client.py b/tests/test_acp_client.py
+new file mode 100644
+index 0000000..a675f82
+--- /dev/null
++++ b/tests/test_acp_client.py
+@@ -0,0 +1,552 @@
++#!/usr/bin/env python3
++"""acp.py 的协议层单测：起真子进程（tests/test_acp_agent_stub.py）走线协议。
++
++跑：python3 -m unittest discover -s tests
++用到的断言全是「帧级」的：stub 把收到的每一帧原样记进 STUB_RECORD，我们直接
++逐字段核对 acp.py 到底发了什么——只测返回值的单测锁不住线协议。
++"""
++import json
++import os
++import shutil
++import sys
++import tempfile
++import threading
++import time
++import unittest
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, REPO)
++
++import acp  # noqa: E402  （sys.path 补好再 import）
++
++STUB = os.path.join(REPO, "tests", "test_acp_agent_stub.py")
++
++# 人格正文：多行 + 中文引号 + 非 GBK 字符（emoji），逼一遍 UTF-8 编解码链路。
++PERSONA = ("你是白砚。\n"
++           "第一行：只讲该讲的，别把这段人格复述给学生。\n"
++           "第二行带引号「」和 emoji 🖌 也不能在管道里丢。")
++
++# 每次起 stub 都把开关钉死，免得外面的 STUB_* 环境变量渗进来。
++BASE_ENV = {
++    "STUB_PROTOCOL_VERSION": "1",
++    "STUB_LOAD_SESSION": "0",
++    "STUB_EXIT_AFTER_INIT": "0",
++    "STUB_SILENT": "0",
++    "STUB_ASK_PERMISSION": "1",
++    "STUB_PERMISSION_OPTIONS": "normal",
++    "STUB_GARBAGE_LINES": "0",
++    "STUB_REQUIRE_SYSTEM_PROMPT": "0",
++    "STUB_USAGE": "0",
++    "STUB_UNKNOWN_REQUEST": "0",
++    "STUB_ECHO_PROMPT": "0",
++    "STUB_PROMPT_BARRIER": "0",
++    "STUB_FAIL_LOAD": "0",
++}
++
++TOOL_CALL = {"toolCallId": "call-1", "title": "读一下教材", "kind": "read"}
++EXPECTED_OPTIONS = {
++    "normal": [
++        {"optionId": "allow-once", "name": "允许一次", "kind": "allow_once"},
++        {"optionId": "reject-once", "name": "拒绝一次", "kind": "reject_once"},
++        {"optionId": "allow-always", "name": "总是允许", "kind": "allow_always"},
++    ],
++    "none": [],
++    "allow-only": [
++        {"optionId": "allow-once", "name": "允许一次", "kind": "allow_once"},
++    ],
++}
++# (决策, stub 给的选项) -> 期望写回 agent 的 outcome
++EXPECTED_OUTCOME = {
++    ("allow", "normal"): {"outcome": "selected", "optionId": "allow-once"},
++    ("allow", "allow-only"): {"outcome": "selected", "optionId": "allow-once"},
++    ("allow", "none"): {"outcome": "cancelled"},
++    ("deny", "normal"): {"outcome": "selected", "optionId": "reject-once"},
++    ("deny", "allow-only"): {"outcome": "cancelled"},
++    ("deny", "none"): {"outcome": "cancelled"},
++    ("cancel", "normal"): {"outcome": "cancelled"},
++    ("cancel", "none"): {"outcome": "cancelled"},
++}
++
++
++def read_frames(path):
++    """把 stub 记下的原始帧读成 dict 列表。"""
++    if not os.path.exists(path):
++        return []
++    with open(path, encoding="utf-8") as f:
++        return [json.loads(line) for line in f if line.strip()]
++
++
++def raw_lines(path):
++    """原始行（未经 json 解析），用来验证「一行一帧」。"""
++    with open(path, encoding="utf-8") as f:
++        return [line.rstrip("\n") for line in f if line.strip()]
++
++
++def frames_with(path, method):
++    return [f for f in read_frames(path) if f.get("method") == method]
++
++
++def wait_until(pred, timeout):
++    """小轮询：等「进程真的退了」这类异步状态。"""
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if pred():
++            return True
++        time.sleep(0.02)
++    return bool(pred())
++
++
++def make_scratch():
++    """建一个本次测试专用的临时目录（平台 TEMP 下），返回路径。
++
++    为什么不用 tempfile.TemporaryDirectory：本机 DSH 沙箱里 mkdtemp 建出来的目录
++    带 0o700 的受限权限，沙箱 token 自己都写不进去、也删不掉——stub 记帧会直接
++    PermissionError，测试全瞎，目录还会变成删不掉的残留。os.makedirs 用默认权限建
++    的目录，读写删在沙箱里都正常，于是自己造一个：语义一样，用完删干净。
++    """
++    base = tempfile.gettempdir()
++    for i in range(1000):
++        path = os.path.join(base, "acp-test-%d-%d" % (os.getpid(), i))
++        try:
++            os.makedirs(path)
++            return path
++        except FileExistsError:
++            continue
++    raise RuntimeError(f"TEMP（{base}）下建不出临时目录")
++
++
++class AcpCase(unittest.TestCase):
++    """起 stub 的公共脚手架：临时目录 + 收干净所有 client。"""
++
++    def setUp(self):
++        self.scratch = make_scratch()
++        # 后注册的后跑：client 先关，再删目录
++        self.addCleanup(lambda: shutil.rmtree(self.scratch, ignore_errors=True))
++        self.clients = []
++
++    def client(self, *, env=None, system_prompt=None, on_permission=None, on_update=None,
++               on_log=None, init_timeout=2.0):
++        """起一个连着 stub 的 AcpClient；返回 (client, 记录文件, 日志列表)。"""
++        record = os.path.join(self.scratch, "record-%d.jsonl" % len(self.clients))
++        stub_env = dict(BASE_ENV)
++        stub_env.update({k: str(v) for k, v in (env or {}).items()})
++        stub_env["STUB_RECORD"] = record
++        logs = []
++        client = acp.AcpClient(
++            sys.executable, [STUB], cwd=REPO, env=stub_env,
++            system_prompt=system_prompt, on_permission=on_permission,
++            on_update=on_update,
++            on_log=on_log if on_log is not None else logs.append,
++            init_timeout=init_timeout)
++        self.clients.append(client)
++        self.addCleanup(client.close)
++        return client, record, logs
++
++
++class InitializeTests(AcpCase):
++    def test_initialize_frame_and_start_result(self):
++        c, record, logs = self.client()
++        info = c.start()
++
++        frames = read_frames(record)
++        self.assertEqual(frames[0]["jsonrpc"], "2.0")
++        self.assertEqual(frames[0]["method"], "initialize")
++        self.assertEqual(frames[0]["id"], 1, "我方 id 从 1 开始自增")
++        params = frames[0]["params"]
++        self.assertEqual(params["protocolVersion"], 1)
++        self.assertEqual(params["clientCapabilities"],
++                         {"fs": {"readTextFile": False, "writeTextFile": False},
++                          "terminal": False})
++        self.assertEqual(params["clientInfo"],
++                         {"name": "teach-platform", "title": "讲课台", "version": "0.2.0"})
++        self.assertEqual(params["clientInfo"], acp.AcpClient.CLIENT_INFO)
++        self.assertEqual(acp.PROTOCOL_VERSION, 1)
++
++        self.assertEqual(frames[1]["method"], "session/new")
++        self.assertEqual(info["sessionId"], "sess-stub")
++        self.assertIs(info["resumed"], False)
++        self.assertEqual(info["protocolVersion"], 1)
++        self.assertEqual(info["agentInfo"], {"name": "stub-acp", "version": "0.0.1"})
++        self.assertIs(info["loadSession"], False)
++        self.assertTrue(c.alive())
++
++    def test_version_mismatch_raises(self):
++        c, record, logs = self.client(env={"STUB_PROTOCOL_VERSION": "2"})
++        with self.assertRaises(acp.AcpError) as cm:
++            c.start()
++        self.assertIn("ACP v2", str(cm.exception))
++        self.assertEqual([f.get("method") for f in read_frames(record)], ["initialize"],
++                         "版本不符就停手，别接着开会话")
++
++
++class SessionRoutingTests(AcpCase):
++    def test_session_new_when_load_session_false(self):
++        c, record, logs = self.client()
++        info = c.start(session_id="old-sid", load_session=False)
++        frames = read_frames(record)
++        self.assertEqual([f.get("method") for f in frames], ["initialize", "session/new"],
++                         "给了 session_id 但没要 load，就不许发 session/load")
++        self.assertNotIn("sessionId", frames[1]["params"])
++        self.assertEqual(info["sessionId"], "sess-stub")
++        self.assertIs(info["resumed"], False)
++
++    def test_session_load_when_requested(self):
++        c, record, logs = self.client(env={"STUB_LOAD_SESSION": "1"})
++        info = c.start(session_id="old-sid", load_session=True)
++        frames = read_frames(record)
++        self.assertEqual([f.get("method") for f in frames], ["initialize", "session/load"])
++        self.assertEqual(frames[1]["params"]["sessionId"], "old-sid")
++        self.assertEqual(frames[1]["params"]["mcpServers"], [])
++        self.assertEqual(info["sessionId"], "old-sid")
++        self.assertIs(info["resumed"], True)
++        self.assertIs(info["loadSession"], True)
++
++    def test_start_without_session_id_is_new(self):
++        c, record, logs = self.client(env={"STUB_LOAD_SESSION": "1"})
++        info = c.start()
++        self.assertEqual([f.get("method") for f in read_frames(record)],
++                         ["initialize", "session/new"])
++        self.assertIs(info["resumed"], False)
++
++    def test_start_sends_absolute_cwd(self):
++        c, record, logs = self.client()
++        c.start()
++        self.assertEqual(frames_with(record, "session/new")[0]["params"]["cwd"], REPO)
++        self.assertTrue(os.path.isabs(frames_with(record, "session/new")[0]["params"]["cwd"]))
++
++    def test_load_error_raises_and_client_can_retry(self):
++        c, record, logs = self.client(env={"STUB_LOAD_SESSION": "1", "STUB_FAIL_LOAD": "1",
++                                           "STUB_ASK_PERMISSION": "0"})
++        with self.assertRaises(acp.AcpError) as cm:
++            c.start(session_id="old-sid", load_session=True)
++        self.assertIn("session/load", str(cm.exception))
++        self.assertIn("-32600", str(cm.exception))
++        self.assertTrue(c.alive(), "error 响应不该毒死连接")
++        # 同一个 client 退回 session/new 接着用：不重开进程、不重复握手
++        info = c.start(load_session=False)
++        self.assertEqual(info["sessionId"], "sess-stub")
++        self.assertIs(info["resumed"], False)
++        self.assertEqual(c.prompt("喂", timeout=5)["stopReason"], "end_turn")
++        self.assertEqual([f.get("method") for f in read_frames(record)],
++                         ["initialize", "session/load", "session/new", "session/prompt"])
++
++    def test_start_again_reuses_connection(self):
++        c, record, logs = self.client()
++        first = c.start()
++        proc = c.proc
++        second = c.start()
++        self.assertIs(c.proc, proc, "第二次 start() 不该重开进程")
++        self.assertEqual(first["sessionId"], "sess-stub")
++        self.assertEqual(second["sessionId"], "sess-stub")
++        self.assertEqual([f.get("method") for f in read_frames(record)],
++                         ["initialize", "session/new", "session/new"], "握手只做一次")
++
++
++class SystemPromptTests(AcpCase):
++    def test_meta_on_session_new(self):
++        c, record, logs = self.client(system_prompt=PERSONA)
++        c.start()
++        meta = frames_with(record, "session/new")[0]["params"]["_meta"]
++        self.assertEqual(meta, {"systemPrompt": PERSONA})
++        self.assertIsInstance(meta["systemPrompt"], str)
++
++    def test_meta_on_session_load(self):
++        c, record, logs = self.client(system_prompt=PERSONA, env={"STUB_LOAD_SESSION": "1"})
++        c.start(session_id="old-sid", load_session=True)
++        meta = frames_with(record, "session/load")[0]["params"]["_meta"]
++        self.assertEqual(meta["systemPrompt"], PERSONA)
++        self.assertIsInstance(meta["systemPrompt"], str)
++
++    def test_no_meta_key_when_no_persona(self):
++        for kwargs in ({}, {"system_prompt": ""}):
++            with self.subTest(kwargs=kwargs):
++                c, record, logs = self.client(**kwargs)
++                c.start()
++                self.assertNotIn("_meta", frames_with(record, "session/new")[0]["params"])
++
++    def test_persona_stays_in_one_frame(self):
++        c, record, logs = self.client(system_prompt=PERSONA)
++        c.start()
++        line = [l for l in raw_lines(record) if "session/new" in l][0]
++        self.assertEqual(len(line.splitlines()), 1, "人格里的换行必须被转义，不能撑破一帧")
++        self.assertIn("第二行带引号「」和 emoji 🖌", line)
++
++
++class PromptTests(AcpCase):
++    def test_prompt_result_and_frame(self):
++        c, record, logs = self.client(system_prompt=PERSONA, env={"STUB_ASK_PERMISSION": "0"})
++        c.start()
++        res = c.prompt("学生：为什么 1+1=2？", timeout=5)
++        self.assertEqual(res["stopReason"], "end_turn")
++        frame = frames_with(record, "session/prompt")[0]
++        self.assertEqual(frame["params"], {
++            "sessionId": "sess-stub",
++            "prompt": [{"type": "text", "text": "学生：为什么 1+1=2？"}],
++        })
++        self.assertNotIn("白砚", json.dumps(frame, ensure_ascii=False),
++                         "人格只挂在 session 上，不能跟着每轮 prompt 重发")
++
++    def test_two_prompts_use_their_own_text(self):
++        c, record, logs = self.client(env={"STUB_ASK_PERMISSION": "0"})
++        c.start()
++        c.prompt("第一轮", timeout=5)
++        c.prompt("第二轮", timeout=5)
++        texts = [f["params"]["prompt"][0]["text"] for f in frames_with(record, "session/prompt")]
++        self.assertEqual(texts, ["第一轮", "第二轮"])
++
++    def test_prompt_before_start_raises(self):
++        c, record, logs = self.client()
++        with self.assertRaises(acp.AcpError):
++            c.prompt("喂", timeout=1)
++
++
++class UpdateTests(AcpCase):
++    def test_updates_in_order_no_replay(self):
++        seen = []
++        c, record, logs = self.client(
++            env={"STUB_ASK_PERMISSION": "0"},
++            on_update=lambda sid, upd, replay: seen.append((sid, upd.get("sessionUpdate"), replay)))
++        c.start()
++        c.prompt("喂", timeout=5)
++        self.assertEqual([k for _, k, _ in seen],
++                         ["agent_message_chunk", "tool_call", "tool_call_update", "plan"])
++        self.assertTrue(all(r is False for _, _, r in seen), "新会话没有重放窗口")
++        self.assertTrue(all(sid == "sess-stub" for sid, _, _ in seen))
++
++    def test_replay_only_in_load_window(self):
++        seen = []
++        c, record, logs = self.client(
++            env={"STUB_LOAD_SESSION": "1", "STUB_ASK_PERMISSION": "0"},
++            on_update=lambda sid, upd, replay: seen.append((sid, upd, replay)))
++        c.start(session_id="old-sid", load_session=True)
++        during = list(seen)                # load 窗口内：先灌历史
++        c.prompt("喂", timeout=5)
++        after = seen[len(during):]
++        self.assertEqual([r for _, _, r in during], [True, True])
++        self.assertEqual([u["content"]["text"] for _, u, _ in during],
++                         ["历史重放 1", "历史重放 2"])
++        self.assertEqual([r for _, _, r in after], [False, False, False, False],
++                         "session/load 的响应一到，重放窗口就该关掉")
++        self.assertEqual([u.get("sessionUpdate") for _, u, _ in after],
++                         ["agent_message_chunk", "tool_call", "tool_call_update", "plan"])
++
++    def test_usage_update_is_harmless(self):
++        seen = []
++        c, record, logs = self.client(
++            env={"STUB_ASK_PERMISSION": "0", "STUB_USAGE": "1"},
++            on_update=lambda sid, upd, replay: seen.append(upd.get("sessionUpdate")))
++        c.start()
++        self.assertEqual(c.prompt("喂", timeout=5)["stopReason"], "end_turn")
++        self.assertEqual(seen, ["agent_message_chunk", "tool_call", "tool_call_update",
++                                "plan", "usage_update"])
++
++
++class PermissionTests(AcpCase):
++    def run_permission(self, decision, options="normal", *, mode="normal"):
++        """跑一轮带权限请求的 prompt，回 (回调收到的实参, 我们回给 agent 的应答帧, client)。
++
++        权限请求是 agent→client 的帧，STUB_RECORD 只记 client→agent，所以请求那一侧
++        用 on_permission 收到的实参核对，应答那一侧从记录里逐字段查。
++        """
++        calls = []
++
++        if mode == "no_callback":
++            on_permission = None
++        else:
++            def on_permission(session_id, tool_call, opts):
++                calls.append((session_id, tool_call, opts))
++                if mode == "raises":
++                    raise RuntimeError("回调炸了")
++                if mode == "bad_value":
++                    return "maybe"
++                return decision
++
++        c, record, logs = self.client(
++            on_permission=on_permission,
++            env={"STUB_ASK_PERMISSION": "1", "STUB_PERMISSION_OPTIONS": options})
++        c.start()
++        self.assertEqual(c.prompt("问一下", timeout=5)["stopReason"], "end_turn")
++
++        frames = read_frames(record)
++        # 记录里唯一「没有 method」的帧就是我们对权限请求的应答
++        resp = [f for f in frames if f.get("method") is None]
++        self.assertEqual(len(resp), 1, frames)
++        return calls, resp[0], c
++
++    def test_policies_frame_by_frame(self):
++        for (decision, options), want in sorted(EXPECTED_OUTCOME.items()):
++            with self.subTest(decision=decision, options=options):
++                calls, resp, c = self.run_permission(decision, options)
++                # 请求那一侧：client 解析出来交给回调的三样东西
++                self.assertEqual(calls, [("sess-stub", TOOL_CALL, EXPECTED_OPTIONS[options])])
++                # 应答那一侧：逐字段
++                self.assertEqual(resp["jsonrpc"], "2.0")
++                self.assertIsInstance(resp["id"], int)
++                self.assertGreaterEqual(resp["id"], 9000,
++                                        "应答必须回 agent 请求的那个 id（stub 的 id 从 9000 起）")
++                self.assertNotIn("error", resp)
++                self.assertEqual(resp["result"], {"outcome": want})
++
++    def test_callback_exception_is_deny(self):
++        calls, resp, c = self.run_permission("allow", mode="raises")
++        self.assertEqual(resp["result"], {"outcome": {"outcome": "selected",
++                                                      "optionId": "reject-once"}})
++
++    def test_unknown_decision_is_deny(self):
++        calls, resp, c = self.run_permission("allow", mode="bad_value")
++        self.assertEqual(resp["result"], {"outcome": {"outcome": "selected",
++                                                      "optionId": "reject-once"}})
++
++    def test_no_callback_is_deny(self):
++        calls, resp, c = self.run_permission("allow", mode="no_callback")
++        self.assertEqual(resp["result"], {"outcome": {"outcome": "selected",
++                                                      "optionId": "reject-once"}})
++
++
++class UnknownMethodTests(AcpCase):
++    def test_unknown_agent_request_gets_32601(self):
++        # stub 收到我们的 error 响应才收尾，所以 prompt 返回时响应帧必然已经在记录里。
++        # 它发的请求（agent→client）记不进 STUB_RECORD，能验的就是我们回的错。
++        c, record, logs = self.client(env={"STUB_UNKNOWN_REQUEST": "1",
++                                           "STUB_ASK_PERMISSION": "0"})
++        c.start()
++        self.assertEqual(c.prompt("喂", timeout=5)["stopReason"], "end_turn")
++        frames = read_frames(record)
++        errs = [f for f in frames if "error" in f]
++        self.assertEqual(len(errs), 1, frames)
++        self.assertEqual(errs[0]["error"],
++                         {"code": -32601, "message": "method not found: session/unknown_thing"})
++        self.assertNotIn("result", errs[0])
++        self.assertIsInstance(errs[0]["id"], int)
++
++
++class GarbageTests(AcpCase):
++    def test_garbage_lines_are_skipped(self):
++        c, record, logs = self.client(env={"STUB_GARBAGE_LINES": "3"})
++        self.assertEqual(c.start()["sessionId"], "sess-stub")
++        self.assertEqual(c.prompt("喂", timeout=5)["stopReason"], "end_turn")
++        self.assertTrue(any("非 JSON" in line for line in logs), logs)
++        self.assertTrue(c.alive(), "脏 stdout 不能把连接读断")
++        self.assertEqual(c.prompt("再喂", timeout=5)["stopReason"], "end_turn")
++
++
++class CrashTests(AcpCase):
++    def test_exit_after_init_fails_inflight_and_alive(self):
++        c, record, logs = self.client(env={"STUB_EXIT_AFTER_INIT": "1"})
++        try:
++            c.start()                   # initialize 回得来；紧随其后的 session/new 可能正好撞上它退出
++        except acp.AcpError:
++            pass
++        self.assertTrue(wait_until(lambda: not c.alive(), 3.0), "stub 没退出")
++        with self.assertRaises(acp.AcpError) as cm:
++            c.prompt("喂", timeout=5)
++        self.assertNotIsInstance(cm.exception, acp.AcpTimeout,
++                                 "进程死了要立刻报错，不能让调用方干等到超时")
++        self.assertFalse(c.alive())
++        self.assertEqual(c.returncode, 0)
++
++
++class CloseTests(AcpCase):
++    def test_close_idempotent_and_reaps(self):
++        c, record, logs = self.client()
++        c.start()
++        proc = c.proc
++        self.assertTrue(c.alive())
++        c.close()
++        self.assertFalse(c.alive())
++        self.assertIsNotNone(proc.poll(), "close() 之后进程必须收掉")
++        c.close()                       # 幂等：第二、三次都不许抛
++        c.close()
++        self.assertIsNotNone(c.returncode)
++
++    def test_close_wakes_waiter(self):
++        c, record, logs = self.client(env={"STUB_SILENT": "1"}, init_timeout=30)
++        errors = []
++
++        def bg():
++            try:
++                c.start()
++            except acp.AcpError as e:
++                errors.append(e)
++
++        t = threading.Thread(target=bg, daemon=True)
++        t.start()
++        time.sleep(0.4)                 # 让它真把 initialize 发出去、挂在那等
++        proc = c.proc
++        c.close()
++        t.join(3)
++        self.assertFalse(t.is_alive(), "close() 没把等待线程叫醒")
++        self.assertEqual(len(errors), 1)
++        self.assertIn("连接已关闭", str(errors[0]))
++        self.assertIsNotNone(proc.poll())
++
++
++class ConcurrencyTests(AcpCase):
++    def test_two_prompts_pair_by_id(self):
++        # stub 攒够 2 个 prompt 才回、而且是倒着回：谁串行化、谁 FIFO 配对，谁就超时
++        c, record, logs = self.client(env={"STUB_ASK_PERMISSION": "0",
++                                           "STUB_PROMPT_BARRIER": "2",
++                                           "STUB_ECHO_PROMPT": "1"})
++        c.start()
++        results, errors = {}, []
++        gate = threading.Barrier(2)
++
++        def run(tag):
++            try:
++                gate.wait(5)
++                results[tag] = c.prompt(tag, timeout=5)
++            except Exception as e:       # noqa: BLE001  测试里全收下来看
++                errors.append((tag, e))
++
++        threads = [threading.Thread(target=run, args=(tag,), daemon=True)
++                   for tag in ("并发甲", "并发乙")]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join(5)
++        self.assertTrue(all(not t.is_alive() for t in threads), "两个 prompt 没同时在飞")
++        self.assertEqual(errors, [])
++        self.assertEqual(set(results), {"并发甲", "并发乙"})
++        for tag, res in results.items():
++            self.assertEqual(res["stopReason"], "end_turn")
++            self.assertEqual(res["promptText"], tag, "响应按 id 配对，不能串线")
++        ids = [f["id"] for f in frames_with(record, "session/prompt")]
++        self.assertEqual(len(ids), 2)
++        self.assertEqual(len(set(ids)), 2)
++
++
++class TimeoutTests(AcpCase):
++    def test_silent_agent_times_out(self):
++        c, record, logs = self.client(env={"STUB_SILENT": "1"}, init_timeout=0.5)
++        t0 = time.monotonic()
++        with self.assertRaises(acp.AcpTimeout) as cm:
++            c.start()
++        elapsed = time.monotonic() - t0
++        self.assertIsInstance(cm.exception, acp.AcpError, "AcpTimeout 得是 AcpError 子类")
++        self.assertGreaterEqual(elapsed, 0.45)
++        self.assertLess(elapsed, 3.0, "超时得在秒级生效，不能挂死")
++        self.assertTrue(c.alive(), "只是不说话，进程还活着")
++        c.close()
++        self.assertIsNotNone(c.proc.poll())
++
++
++class PersonaReverseLockTests(AcpCase):
++    def test_missing_persona_makes_stub_exit_3(self):
++        c, record, logs = self.client(system_prompt=None,
++                                      env={"STUB_REQUIRE_SYSTEM_PROMPT": "1"})
++        with self.assertRaises(acp.AcpError) as cm:
++            c.start()
++        self.assertNotIsInstance(cm.exception, acp.AcpTimeout)
++        self.assertEqual(c.proc.wait(timeout=5), 3,
++                         "stub 以 exit 3 明说：驱动器没把人格发出来")
++        self.assertEqual(c.returncode, 3)
++
++    def test_persona_present_passes_the_lock(self):
++        c, record, logs = self.client(system_prompt=PERSONA,
++                                      env={"STUB_REQUIRE_SYSTEM_PROMPT": "1"})
++        self.assertEqual(c.start()["sessionId"], "sess-stub")
++        self.assertEqual(c.prompt("喂", timeout=5)["stopReason"], "end_turn")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_agent_args.py b/tests/test_agent_args.py
+new file mode 100644
+index 0000000..5bf43f2
+--- /dev/null
++++ b/tests/test_agent_args.py
+@@ -0,0 +1,263 @@
++#!/usr/bin/env python3
++"""driver.py 的 agent 配置层单测：只用标准库。
++
++跑：python3 -m unittest discover -s tests
++    （Windows 上 python 是 Store stub，用绝对路径解释器，别用裸 python）
++"""
++import os
++import shutil
++import sys
++import tempfile
++import unittest
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, REPO)
++
++import driver
++
++# 一个**一定存在**的程序：配置层要 resolve_bin 通过才能验后面的分支。
++BIN = sys.executable or "python"
++
++
++def make_scratch():
++    """建本次测试专用的临时目录（平台 TEMP 下），返回路径。
++
++    不用 tempfile.TemporaryDirectory：本机沙箱里 mkdtemp 建的目录带 0o700，
++    受限进程自己都写不进去、也删不掉（测试全瞎还留一堆删不掉的残留）。
++    os.makedirs 用默认权限建，读写删在沙箱里都正常。
++    """
++    base = tempfile.gettempdir()
++    for i in range(1000):
++        path = os.path.join(base, "inkstone-args-%d-%d" % (os.getpid(), i))
++        try:
++            os.makedirs(path)
++            return path
++        except FileExistsError:
++            continue
++    raise RuntimeError(f"TEMP（{base}）下建不出临时目录")
++
++
++class TempLog(unittest.TestCase):
++    """把 driver.LOG 指到临时目录：测试里触发的告警别写进仓库根的 driver.log。"""
++
++    def setUp(self):
++        self._tmp = make_scratch()
++        self.addCleanup(lambda: shutil.rmtree(self._tmp, ignore_errors=True))
++        self._log_before = driver.LOG
++        driver.LOG = os.path.join(self._tmp, "driver.log")
++        driver._WARNED.clear()
++        self.addCleanup(self._restore)
++
++    def _restore(self):
++        driver.LOG = self._log_before
++        driver._WARNED.clear()
++
++
++class SplitArgs(unittest.TestCase):
++    def test_whitespace_and_newlines(self):
++        self.assertEqual(driver.split_args("  -a\t-b\n -c  "), ["-a", "-b", "-c"])
++
++    def test_quoted_group_keeps_spaces(self):
++        self.assertEqual(driver.split_args('-x "a b" -y'), ["-x", "a b", "-y"])
++
++    def test_quotes_stripped_mid_token(self):
++        self.assertEqual(driver.split_args('--p="a b"'), ["--p=a b"])
++
++    def test_backslash_not_an_escape(self):
++        bs = chr(92)
++        raw = "C:" + bs + "Users" + bs + "x" + bs + "y.json"
++        self.assertEqual(driver.split_args(raw), [raw])
++        self.assertEqual(driver.split_args('"a ' + bs + ' b"'), ["a " + bs + " b"])
++
++    def test_empty(self):
++        self.assertEqual(driver.split_args(""), [])
++        self.assertEqual(driver.split_args("   \n\t "), [])
++
++    def test_empty_quoted_token(self):
++        self.assertEqual(driver.split_args('-x ""'), ["-x", ""])
++
++    def test_unbalanced_quote_raises(self):
++        with self.assertRaises(driver.ConfigError):
++            driver.split_args('--x "unclosed')
++        with self.assertRaises(driver.ConfigError):
++            driver.split_args('--x "unclosed ')
++
++
++class ResolveBin(unittest.TestCase):
++    def test_missing_name_gives_none(self):
++        self.assertIsNone(driver.resolve_bin("definitely-not-a-real-agent-xyz"))
++
++    def test_empty_gives_none(self):
++        self.assertIsNone(driver.resolve_bin(""))
++
++    def test_absolute_existing_path_resolves(self):
++        self.assertEqual(driver.resolve_bin(BIN), BIN)
++
++
++class ExpandArgs(unittest.TestCase):
++    def _expand(self, tokens, **kw):
++        kw.setdefault("prompt", "PROMPT")
++        kw.setdefault("prompt_file", os.path.join("abs", "prompts", "白砚.md"))
++        kw.setdefault("session", "")
++        return driver.expand_args(tokens, **kw)
++
++    def test_prompt_and_prompt_file(self):
++        self.assertEqual(self._expand(["{prompt}", "{prompt_file}"]),
++                         ["PROMPT", os.path.join("abs", "prompts", "白砚.md")])
++
++    def test_prompt_with_spaces_stays_one_token(self):
++        # 人格全文带换行/空白：必须整块作为一个 argv token，不能按空白再切
++        full = "你是白砚。\n讲课时慢一点，别一次讲太多。"
++        self.assertEqual(self._expand(["--sys", "{prompt}"], prompt=full), ["--sys", full])
++
++    def test_session_placeholder(self):
++        self.assertEqual(self._expand(["--id", "{session}"], session="s1"), ["--id", "s1"])
++        self.assertEqual(self._expand(["--id", "{session}"]), ["--id", ""])
++
++    def test_unknown_placeholder_kept_verbatim(self):
++        self.assertEqual(self._expand(["--x", "{foo}", "{prompt}bar", "{ }"]),
++                         ["--x", "{foo}", "{prompt}bar", "{ }"])
++
++    def test_no_resume_placeholder_left(self):
++        # {resume} 已经删掉：现在会原样传给 agent（属于"不认识"那一类）
++        self.assertEqual(self._expand(["{resume}"]), ["{resume}"])
++
++class ConfigDefaults(TempLog):
++    """不设任何 TEACH_AGENT_* 时的默认值（BIN 是唯一必填项）。"""
++
++    def test_defaults(self):
++        cfg = driver.load_config({"TEACH_AGENT_BIN": BIN})
++        self.assertEqual(cfg.bin, BIN)
++        self.assertEqual(cfg.bin_path, BIN)
++        self.assertEqual(cfg.args_raw, "")
++        self.assertEqual(cfg.arg_tokens, [])
++        self.assertEqual(cfg.system_prompt_mode, "meta")
++        self.assertEqual(cfg.permission, "allow")
++        self.assertFalse(cfg.log_updates)
++        self.assertEqual(cfg.protocol, "1")
++        self.assertFalse(cfg.dry)
++
++    def test_default_args_is_empty(self):
++        self.assertEqual(driver.DEFAULT_AGENT_ARGS, "")
++
++    def test_placeholder_set(self):
++        # {resume} 已删；留下的三个正好是 expand_args 认的那三个
++        self.assertEqual(tuple(driver.PLACEHOLDERS), ("prompt", "prompt_file", "session"))
++
++    def test_modes(self):
++        self.assertEqual(driver.SYSTEM_PROMPT_MODES, ("meta", "meta_append", "args", "both", "none"))
++        self.assertEqual(driver.PERMISSION_MODES, ("allow", "deny", "cancel"))
++
++
++class ConfigOverrides(TempLog):
++    def test_everything_overridden(self):
++        cfg = driver.load_config({
++            "TEACH_AGENT_BIN": BIN,
++            "TEACH_AGENT_ARGS": '--sys "a b" {prompt} {prompt_file} {session}',
++            "TEACH_AGENT_SYSTEM_PROMPT": "both",
++            "TEACH_AGENT_PERMISSION": "deny",
++            "TEACH_AGENT_LOG_UPDATES": "1",
++            "TEACH_AGENT_PROTOCOL": "1",
++            "TEACH_DRY": "1",
++        })
++        self.assertEqual(cfg.arg_tokens,
++                         ["--sys", "a b", "{prompt}", "{prompt_file}", "{session}"])
++        self.assertEqual(cfg.system_prompt_mode, "both")
++        self.assertEqual(cfg.permission, "deny")
++        self.assertTrue(cfg.log_updates)
++        self.assertTrue(cfg.dry)
++
++    def test_each_system_prompt_mode_accepted(self):
++        for mode in driver.SYSTEM_PROMPT_MODES:
++            cfg = driver.load_config({"TEACH_AGENT_BIN": BIN,
++                                      "TEACH_AGENT_SYSTEM_PROMPT": mode})
++            self.assertEqual(cfg.system_prompt_mode, mode)
++
++    def test_each_permission_mode_accepted(self):
++        for mode in driver.PERMISSION_MODES:
++            cfg = driver.load_config({"TEACH_AGENT_BIN": BIN, "TEACH_AGENT_PERMISSION": mode})
++            self.assertEqual(cfg.permission, mode)
++
++    def test_log_updates_only_one_is_true(self):
++        for raw, want in (("0", False), ("1", True)):
++            cfg = driver.load_config({"TEACH_AGENT_BIN": BIN, "TEACH_AGENT_LOG_UPDATES": raw})
++            self.assertIs(cfg.log_updates, want)
++
++    def test_env_values_are_stripped(self):
++        cfg = driver.load_config({"TEACH_AGENT_BIN": BIN,
++                                  "TEACH_AGENT_SYSTEM_PROMPT": " args ",
++                                  "TEACH_AGENT_PERMISSION": " cancel "})
++        self.assertEqual(cfg.system_prompt_mode, "args")
++        self.assertEqual(cfg.permission, "cancel")
++
++    def test_empty_agent_args_means_no_template_tokens(self):
++        cfg = driver.load_config({"TEACH_AGENT_BIN": BIN, "TEACH_AGENT_ARGS": ""})
++        self.assertEqual(cfg.arg_tokens, [])
++
++    def test_old_dry_name_still_works(self):
++        cfg = driver.load_config({"TEACH_AGENT_BIN": BIN, "DRIVER_DRY": "1"})
++        self.assertTrue(cfg.dry)
++
++
++class EnvHelpers(TempLog):
++    """TEACH_DRY / TEACH_POLL 的读法（含旧名字兜底）。"""
++
++    def test_dry_default_and_value(self):
++        self.assertFalse(driver.read_dry({}))
++        self.assertTrue(driver.read_dry({"TEACH_DRY": "1"}))
++        self.assertFalse(driver.read_dry({"TEACH_DRY": "0"}))
++
++    def test_dry_old_name_fallback(self):
++        self.assertTrue(driver.read_dry({"DRIVER_DRY": "1"}))
++
++    def test_dry_new_name_wins(self):
++        self.assertTrue(driver.read_dry({"TEACH_DRY": "1", "DRIVER_DRY": "0"}))
++
++    def test_poll_default_and_value(self):
++        self.assertEqual(driver.read_poll({}), 2.0)
++        self.assertEqual(driver.read_poll({"TEACH_POLL": "0.5"}), 0.5)
++
++    def test_poll_old_name_fallback(self):
++        self.assertEqual(driver.read_poll({"DRIVER_POLL": "3"}), 3.0)
++
++    def test_poll_garbage_falls_back_to_default(self):
++        self.assertEqual(driver.read_poll({"TEACH_POLL": "abc"}), 2.0)
++        self.assertEqual(driver.read_poll({"TEACH_POLL": "0"}), 2.0)
++        self.assertEqual(driver.read_poll({"TEACH_POLL": "-1"}), 2.0)
++
++
++class LoadConfigPurity(TempLog):
++    """load_config 是纯函数：只读传进来的字典。"""
++
++    def test_does_not_read_os_environ(self):
++        keep = dict(os.environ)
++        try:
++            os.environ["TEACH_AGENT_BIN"] = "poisoned-bin"
++            os.environ["TEACH_AGENT_SYSTEM_PROMPT"] = "yolo"
++            os.environ["TEACH_AGENT_PERMISSION"] = "yolo"
++            os.environ["TEACH_AGENT_ARGS"] = "--poisoned"
++            cfg = driver.load_config({"TEACH_AGENT_BIN": BIN})
++        finally:
++            os.environ.clear()
++            os.environ.update(keep)
++        self.assertEqual(cfg.bin, BIN)
++        self.assertEqual(cfg.arg_tokens, [])
++        self.assertEqual(cfg.system_prompt_mode, "meta")
++        self.assertEqual(cfg.permission, "allow")
++
++    def test_does_not_write_os_environ(self):
++        before = dict(os.environ)
++        driver.load_config({"TEACH_AGENT_BIN": BIN, "TEACH_DRY": "1",
++                            "TEACH_AGENT_ARGS": "--x {foo}"})
++        self.assertEqual(dict(os.environ), before)
++
++    def test_does_not_change_module_constants(self):
++        base, prompt, sessions = driver.BASE, driver.PROMPT_FILE, driver.SESSIONS
++        driver.load_config({"TEACH_AGENT_BIN": BIN, "TEACH_BASE": "http://poisoned"})
++        self.assertEqual(driver.BASE, base)
++        self.assertEqual(driver.PROMPT_FILE, prompt)
++        self.assertEqual(driver.SESSIONS, sessions)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_driver_acp.py b/tests/test_driver_acp.py
+new file mode 100644
+index 0000000..a9f1a00
+--- /dev/null
++++ b/tests/test_driver_acp.py
+@@ -0,0 +1,745 @@
++#!/usr/bin/env python3
++"""driver.py 的集成测试：真起 stub agent（tests/test_acp_agent_stub.py）+ 一个只实现
++/api/state 与 /api/session 的 stdlib HTTP stub，把驱动器整条路走一遍。
++
++跑：python3 -m unittest discover -s tests
++断言分三层：
++  · 帧级：stub 把收到的每一帧原样记进 STUB_RECORD，直接核对驱动器到底发了什么；
++  · 副作用级：POST /api/session 的 body、log 文案、inbox 有没有被写；
++  · 源码级：driver.py 里不许再出现旧协议的字面量。
++"""
++import json
++import os
++import shutil
++import sys
++import tempfile
++import threading
++import time
++import unittest
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, REPO)
++
++import driver  # noqa: E402  （sys.path 补好再 import）
++
++STUB = os.path.join(REPO, "tests", "test_acp_agent_stub.py")
++STUB_SID = "sess-stub"                       # stub 的 session/new 固定回这个
++PYEXE = sys.executable                       # stub 用同一个解释器起
++STUB_CALL = '"%s"' % STUB
++# 一个**一定存在**的程序：非空跑时 check_config 要 resolve_bin 过得去
++BIN_OK = PYEXE
++
++# 人格正文：多行 + 唯一标记 + emoji。标记绝不能出现在用户消息里。
++PERSONA = ("你是白砚，讲课台的讲义分身。\n"
++           "PERSONA-MARKER-7f3a9c：这段只许走系统提示通道，不许出现在用户消息里。\n"
++           "带中文引号「」和 emoji 🖌 也要原样过管道。")
++MARKER = "PERSONA-MARKER-7f3a9c"
++
++# stub 的行为开关：全部经 os.environ 传给子进程（acp.py 把驱动器进程的环境整个交给 agent）
++STUB_ENV_KEYS = ("STUB_PROTOCOL_VERSION", "STUB_LOAD_SESSION", "STUB_EXIT_AFTER_INIT",
++                 "STUB_SILENT", "STUB_ASK_PERMISSION", "STUB_PERMISSION_OPTIONS",
++                 "STUB_GARBAGE_LINES", "STUB_REQUIRE_SYSTEM_PROMPT", "STUB_USAGE",
++                 "STUB_UNKNOWN_REQUEST", "STUB_ECHO_PROMPT", "STUB_PROMPT_BARRIER",
++                 "STUB_FAIL_LOAD", "STUB_RECORD", "STUB_LOG")
++
++
++def make_scratch():
++    """建本次测试专用的临时目录（平台 TEMP 下），返回路径。
++
++    不用 tempfile.TemporaryDirectory：本机沙箱里 mkdtemp 建的目录带 0o700，
++    受限进程自己都写不进去、也删不掉（stub 记帧会直接 PermissionError，测试全瞎
++    还留一地删不掉的残留）。os.makedirs 用默认权限建，读写删在沙箱里都正常。
++    """
++    base = tempfile.gettempdir()
++    for i in range(1000):
++        path = os.path.join(base, "inkstone-drv-%d-%d" % (os.getpid(), i))
++        try:
++            os.makedirs(path)
++            return path
++        except FileExistsError:
++            continue
++    raise RuntimeError(f"TEMP（{base}）下建不出临时目录")
++
++
++def read_text(path):
++    try:
++        with open(path, encoding="utf-8") as f:
++            return f.read()
++    except OSError:
++        return ""
++
++
++def read_frames(path):
++    """把 stub 记下的每帧读回来（文件可能正在被追加，坏行直接跳）。"""
++    out = []
++    for line in read_text(path).splitlines():
++        line = line.strip()
++        if not line:
++            continue
++        try:
++            out.append(json.loads(line))
++        except ValueError:
++            continue
++    return out
++
++
++def find_frame(frames, method):
++    return next((f for f in frames if f.get("method") == method), None)
++
++
++def count_frames(path, method):
++    return len([f for f in read_frames(path) if f.get("method") == method])
++
++
++def wait_for(pred, timeout=6.0):
++    """等某个条件成立；喂话/回话都是后台线程干的，测试只能轮询。"""
++    end = time.time() + timeout
++    while time.time() < end:
++        if pred():
++            return True
++        time.sleep(0.02)
++    return bool(pred())
++
++
++# ---- 讲课台 HTTP stub：只实现驱动器要用的两个接口 ----
++
++STATE_PAYLOAD = {
++    "course": "semi",
++    "title": "半导体物理",
++    "offset": 10,
++    "chapters": [{"id": "1", "title": "第一章 能带", "page": 13},
++                 {"id": "2", "title": "第二章 载流子", "page": 40}],
++}
++
++
++class ApiStub:
++    """记下驱动器打过来的请求，够断言就行。"""
++
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.sessions = []      # POST /api/session 的 body，按顺序
++        self.state_paths = []   # GET /api/state 的 path
++
++    def record_session(self, body):
++        with self.lock:
++            self.sessions.append(body)
++
++    def record_state(self, path):
++        with self.lock:
++            self.state_paths.append(path)
++
++
++class _ApiHandler(BaseHTTPRequestHandler):
++    api = None      # 每个测试 setUp 时挂上
++
++    def log_message(self, *args):       # 别往 stderr 刷访问日志
++        pass
++
++    def _json(self, obj, code=200):
++        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
++        self.send_response(code)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def do_GET(self):
++        if self.path.startswith("/api/state"):
++            self.api.record_state(self.path)
++            return self._json(STATE_PAYLOAD)
++        self._json({"error": "not found"}, 404)
++
++    def do_POST(self):
++        n = int(self.headers.get("Content-Length") or 0)
++        raw = self.rfile.read(n) if n else b""
++        try:
++            body = json.loads(raw or b"{}")
++        except ValueError:
++            body = {}
++        if self.path == "/api/session":
++            self.api.record_session(body)
++            return self._json({"ok": True, **body})
++        self._json({"error": "not found"}, 404)
++
++
++def start_api(api):
++    handler = type("_BoundApiHandler", (_ApiHandler,), {"api": api})
++    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    return server
++
++class ScratchCase(unittest.TestCase):
++    """轻量脚手架：一个临时目录 + 把 driver.LOG 指进去（别写仓库根的 driver.log）。"""
++
++    def setUp(self):
++        self.scratch = make_scratch()
++        self.addCleanup(lambda: shutil.rmtree(self.scratch, ignore_errors=True))
++        self.log_path = os.path.join(self.scratch, "driver.log")
++        self._log_before = driver.LOG
++        driver.LOG = self.log_path
++        driver._WARNED.clear()
++        self.addCleanup(self._restore_log)
++
++    def _restore_log(self):
++        driver.LOG = self._log_before
++        driver._WARNED.clear()
++
++    def log_text(self):
++        return read_text(self.log_path)
++
++
++class DriverCase(ScratchCase):
++    """集成脚手架：临时目录 + 讲课台 HTTP stub + stub agent 的开关。"""
++
++    def setUp(self):
++        super().setUp()
++        self.state = os.path.join(self.scratch, "state")
++        os.makedirs(self.state)
++        self.inbox = os.path.join(self.scratch, "inbox.jsonl")
++        self.persona = os.path.join(self.scratch, "persona.md")
++        self.record = os.path.join(self.scratch, "record.jsonl")
++        with open(self.persona, "w", encoding="utf-8") as f:
++            f.write(PERSONA)
++
++        # 把 driver 的路径常量全指到临时目录：仓库根不许留下 state/、driver.log、inbox.jsonl
++        self._saved = {}
++        for name, value in (("STATE", self.state),
++                            ("SESSIONS", os.path.join(self.state, "sessions.json")),
++                            ("INBOX", self.inbox),
++                            ("PROMPT_FILE", self.persona),
++                            ("LOG", self.log_path)):
++            self._saved[name] = getattr(driver, name)
++            setattr(driver, name, value)
++        self.addCleanup(self._restore_modules)
++
++        self.api = ApiStub()
++        self.server = start_api(self.api)
++        self.addCleanup(self.server.server_close)
++        self.addCleanup(self.server.shutdown)
++        self._saved["BASE"] = driver.BASE
++        driver.BASE = "http://127.0.0.1:%d" % self.server.server_address[1]
++
++        self._env_saved = {k: os.environ.get(k) for k in STUB_ENV_KEYS}
++        for key in STUB_ENV_KEYS:
++            os.environ.pop(key, None)
++        os.environ["STUB_RECORD"] = self.record
++        os.environ["STUB_LOG"] = os.path.join(self.scratch, "stub.log")
++        self.addCleanup(self._restore_env)
++
++        driver.G.update({"target": None, "sess": None, "dead": None})
++        self.sessions = []
++        self.addCleanup(self._stop_sessions)
++
++    # ---- 收尾 ----
++    def _stop_sessions(self):
++        for sess in self.sessions:
++            try:
++                sess.stop()
++            except Exception:
++                pass
++        if driver.G["sess"]:
++            try:
++                driver.G["sess"].stop()
++            except Exception:
++                pass
++        driver.G.update({"target": None, "sess": None, "dead": None})
++
++    def _restore_modules(self):
++        for name, value in self._saved.items():
++            setattr(driver, name, value)
++
++    def _restore_env(self):
++        for key, value in self._env_saved.items():
++            if value is None:
++                os.environ.pop(key, None)
++            else:
++                os.environ[key] = value
++
++    # ---- 造配置 / 造会话 ----
++    def cfg(self, *, args=None, system_prompt="meta", permission="allow",
++            log_updates=False, dry=False, bin_name=None):
++        return driver.load_config({
++            "TEACH_AGENT_BIN": bin_name or BIN_OK,
++            "TEACH_AGENT_ARGS": STUB_CALL if args is None else args,
++            "TEACH_AGENT_SYSTEM_PROMPT": system_prompt,
++            "TEACH_AGENT_PERMISSION": permission,
++            "TEACH_AGENT_LOG_UPDATES": "1" if log_updates else "0",
++            "TEACH_DRY": "1" if dry else "0",
++        })
++
++    def sess(self, course="semi", chapter="1", **kw):
++        sess = driver.Session(course, chapter, self.cfg(**kw))
++        self.sessions.append(sess)
++        return sess
++
++    def patch_live(self, live):
++        """把 current_live 钉成固定值（主循环单测用）；用完自动还原。"""
++        before = driver.current_live
++        driver.current_live = lambda: live
++        self.addCleanup(lambda: setattr(driver, "current_live", before))
++
++    # ---- 读 record / log ----
++    def frames(self):
++        return read_frames(self.record)
++
++    def prompts(self):
++        return [f["params"]["prompt"][0]["text"] for f in self.frames()
++                if f.get("method") == "session/prompt"]
++
++    def wait_prompts(self, n, timeout=8.0):
++        ok = wait_for(lambda: len(self.prompts()) >= n, timeout)
++        self.assertTrue(ok, "等 session/prompt×%d 超时；record=%r" % (n, self.frames()))
++        return self.prompts()
++
++    def write_sessions(self, sid, course="semi", chapter="1"):
++        path = os.path.join(self.state, "sessions.json")
++        with open(path, "w", encoding="utf-8") as f:
++            json.dump({course: {chapter: {"sid": sid}}}, f)
++
++    def append_inbox(self, *records):
++        with open(self.inbox, "a", encoding="utf-8") as f:
++            for rec in records:
++                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
++
++
++class NewSession(DriverCase):
++    """新会话：人格走 _meta 系统提示通道，用户消息里绝不带人格正文。"""
++
++    def test_persona_goes_to_meta_not_user_message(self):
++        os.environ["STUB_REQUIRE_SYSTEM_PROMPT"] = "1"   # 人格没发出来 stub 就 exit 3
++        sess = self.sess()
++        sess.start()
++        self.wait_prompts(1)
++
++        frm = self.frames()
++        new = find_frame(frm, "session/new")
++        self.assertIsNotNone(new, "没发 session/new：%r" % (frm,))
++        self.assertEqual(new["params"]["_meta"]["systemPrompt"], PERSONA)
++        self.assertEqual(new["params"]["mcpServers"], [])
++        self.assertTrue(os.path.isabs(new["params"]["cwd"]))
++        self.assertEqual(new["params"]["cwd"], REPO)
++
++        prompt = find_frame(frm, "session/prompt")
++        self.assertNotIn("_meta", prompt["params"])
++        text = prompt["params"]["prompt"][0]["text"]
++        self.assertNotIn(MARKER, text)                  # 硬验收：人格不进用户消息
++        self.assertNotIn("只许走系统提示通道", text)
++        self.assertIn("/api/state", text)               # 旧版三段交代语义还在
++        self.assertIn("POST /api/append", text)
++        self.assertIn("teach.py view", text)
++        self.assertNotIn("Read", text)                  # Claude 专有工具名不再出现
++        self.assertEqual(prompt["params"]["prompt"][0]["type"], "text")
++
++        # 拿到 sessionId 后照旧登记：body 与 ACP sessionId 一致
++        self.assertEqual(sess.sid, STUB_SID)
++        self.assertEqual(self.api.sessions[-1],
++                         {"course": "semi", "chapter": "1", "sid": STUB_SID})
++
++    def test_tool_call_becomes_one_log_line(self):
++        sess = self.sess()
++        sess.start()
++        self.wait_prompts(1)
++        self.assertTrue(wait_for(lambda: "[白砚工具]" in self.log_text()),
++                        "没记工具日志：%s" % self.log_text())
++        self.assertIn("[白砚工具] 读一下教材 (read/pending)", self.log_text())
++        # 默认不记 agent_message_chunk：讲稿是白砚自己 POST /api/append 的事
++        self.assertNotIn("[白砚说]", self.log_text())
++
++    def test_message_chunk_logged_only_when_enabled(self):
++        sess = self.sess(log_updates=True)
++        sess.start()
++        self.wait_prompts(1)
++        self.assertTrue(wait_for(lambda: "[白砚说]" in self.log_text()),
++                        "开了 LOG_UPDATES 却没记 chunk：%s" % self.log_text())
++        self.assertIn("收到：", self.log_text())
++
++    def test_seed_uses_state_api_for_chapter_meta(self):
++        sess = self.sess()
++        sess.start()
++        self.wait_prompts(1)
++        self.assertTrue(any("course=semi" in p for p in self.api.state_paths))
++        self.assertIn("第一章 能带", self.prompts()[0])
++        self.assertIn("半导体物理", self.prompts()[0])
++
++
++class SystemPromptChannels(DriverCase):
++    """人格的三条通道：meta（默认）/ args / both / none。"""
++
++    def args_template(self):
++        return '"%s" --persona {prompt} {prompt_file}' % STUB
++
++    def test_args_channel_persona_is_single_argv_token(self):
++        sess = self.sess(system_prompt="args", args=self.args_template())
++        sess.start()
++        self.wait_prompts(1)
++        # 人格全文带换行/空格，但必须是一个 argv token
++        self.assertEqual(sess.argv, [BIN_OK, STUB, "--persona", PERSONA, self.persona])
++        new = find_frame(self.frames(), "session/new")
++        self.assertNotIn("_meta", new["params"])        # 只走 argv，不再挂 _meta
++        self.assertNotIn(MARKER, self.prompts()[0])
++
++    def test_none_channel_has_neither(self):
++        sess = self.sess(system_prompt="none", args=self.args_template())
++        sess.start()
++        self.wait_prompts(1)
++        self.assertEqual(sess.argv, [BIN_OK, STUB, "--persona", "", ""])
++        new = find_frame(self.frames(), "session/new")
++        self.assertNotIn("_meta", new["params"])
++        self.assertNotIn(MARKER, self.prompts()[0])
++
++    def test_both_channel_gives_both(self):
++        os.environ["STUB_REQUIRE_SYSTEM_PROMPT"] = "1"
++        sess = self.sess(system_prompt="both", args=self.args_template())
++        sess.start()
++        self.wait_prompts(1)
++        self.assertEqual(sess.argv, [BIN_OK, STUB, "--persona", PERSONA, self.persona])
++        new = find_frame(self.frames(), "session/new")
++        self.assertEqual(new["params"]["_meta"]["systemPrompt"], PERSONA)
++        self.assertNotIn(MARKER, self.prompts()[0])
++
++    def test_meta_append_also_uses_meta(self):
++        os.environ["STUB_REQUIRE_SYSTEM_PROMPT"] = "1"
++        sess = self.sess(system_prompt="meta_append")
++        sess.start()
++        self.wait_prompts(1)
++        new = find_frame(self.frames(), "session/new")
++        self.assertEqual(new["params"]["_meta"]["systemPrompt"], PERSONA)
++        # 通道名只有空跑日志里会点（真起进程时走哪条路由 acp.py 决定，不重复记）
++        self.sess(dry=True, bin_name="x", system_prompt="meta_append").start()
++        self.assertIn("channel=meta_append", self.log_text())
++
++class ResumeSession(DriverCase):
++    """续会话：有 sid 走 session/load；续不上就丢掉旧 sid、另开新会话。"""
++
++    def test_existing_sid_uses_session_load(self):
++        self.write_sessions("old-sid-123")
++        os.environ["STUB_LOAD_SESSION"] = "1"
++        sess = self.sess()
++        sess.start()
++        self.wait_prompts(1)
++
++        load = find_frame(self.frames(), "session/load")
++        self.assertIsNotNone(load, "有 sid 却没走 session/load：%r" % (self.frames(),))
++        self.assertEqual(load["params"]["sessionId"], "old-sid-123")
++        self.assertEqual(load["params"]["_meta"]["systemPrompt"], PERSONA)
++        self.assertIsNone(find_frame(self.frames(), "session/new"))
++        self.assertEqual(sess.sid, "old-sid-123")
++        self.assertEqual(self.api.sessions[-1]["sid"], "old-sid-123")
++        self.assertIn("接着上次讲", self.prompts()[0])   # 续会话那套交代
++        self.assertNotIn(MARKER, self.prompts()[0])
++        self.assertTrue(sess.alive())                    # 重放的历史不致命
++
++    def test_load_error_falls_back_to_new_session(self):
++        self.write_sessions("gone-sid")
++        os.environ["STUB_FAIL_LOAD"] = "1"               # stub 故意让 session/load 回 error
++        sess = self.sess()
++        sess.start()
++        self.wait_prompts(1)
++
++        frm = self.frames()
++        self.assertIsNotNone(find_frame(frm, "session/load"))
++        self.assertIsNotNone(find_frame(frm, "session/new"),
++                             "load 失败后没回退 session/new：%r" % (frm,))
++        self.assertEqual(sess.sid, STUB_SID)             # 落了新 sid
++        self.assertEqual(self.api.sessions[-1]["sid"], STUB_SID)
++        log = self.log_text()
++        self.assertIn("旧会话 gone-sid 无法续", log)
++        self.assertIn("另开新会话", log)
++        self.assertTrue(sess.alive())                    # 回退不算启动失败
++        self.assertIn("学生刚在讲课台唤醒", self.prompts()[0])   # 换成新开那套交代
++        self.assertNotIn("接着上次讲", self.prompts()[0])
++
++    def test_no_sid_means_session_new(self):
++        os.environ["STUB_LOAD_SESSION"] = "1"            # agent 支持续，但我们没 sid
++        sess = self.sess()
++        sess.start()
++        self.wait_prompts(1)
++        self.assertIsNone(find_frame(self.frames(), "session/load"))
++        self.assertIsNotNone(find_frame(self.frames(), "session/new"))
++
++
++class InboxFeed(DriverCase):
++    """收件箱：跨课/跨章过滤，本课本章每条只喂一次。"""
++
++    def test_filters_and_feeds_once(self):
++        sess = self.sess()
++        sess.start()
++        self.wait_prompts(1)                             # 开场白
++        self.append_inbox(
++            {"course": "semi", "chapter": "1", "text": "老师好"},
++            {"course": "semi", "chapter": "2", "text": "别的章"},
++            {"course": "signals", "chapter": "1", "text": "别的课"},
++            {"course": "semi", "chapter": 1, "text": "章号是数字"},
++            {"course": "semi", "chapter": "1", "text": "",
++             "images": [{"path": "board-1.png"}]},
++        )
++        sess.poll_inbox()
++        self.wait_prompts(4)
++
++        joined = "\n".join(self.prompts())
++        self.assertIn("学生：老师好", joined)
++        self.assertIn("学生：章号是数字", joined)          # 数字章号也算本章
++        self.assertIn("board-1.png", joined)             # 图片仍走路径别名
++        self.assertIn("打开那张图看", joined)
++        self.assertNotIn("Read", joined)
++        self.assertIn("学生：（只发了图）", joined)
++        self.assertNotIn("别的章", joined)
++        self.assertNotIn("别的课", joined)
++
++        sess.poll_inbox()                                # 同一份 inbox 不重喂
++        time.sleep(0.4)
++        self.assertEqual(len(self.prompts()), 4)
++        self.assertEqual(sess.fed, 5)
++
++    def test_start_swallows_old_inbox(self):
++        self.append_inbox({"course": "semi", "chapter": "1", "text": "开讲前的老话"})
++        sess = self.sess()
++        sess.start()
++        self.wait_prompts(1)
++        sess.poll_inbox()
++        time.sleep(0.3)
++        self.assertEqual(len(self.prompts()), 1)         # 老话不重喂
++        self.assertNotIn("开讲前的老话", "\n".join(self.prompts()))
++
++
++class MainLoop(DriverCase):
++    """主循环的一拍：起停、进程死后不重试、换章收旧。"""
++
++    def test_dead_process_stops_chapter_without_retry(self):
++        self.patch_live(("semi", "1"))
++        cfg = self.cfg()
++        driver.tick(cfg)
++        sess = driver.G["sess"]
++        self.assertIsNotNone(sess, "第一拍没起白砚")
++        self.sessions.append(sess)
++        self.wait_prompts(1)
++        inits = count_frames(self.record, "initialize")
++
++        sess.client.close()                              # 等价于白砚进程退出
++        self.assertFalse(sess.alive())
++        driver.tick(cfg)                                 # 发现死了：日志 + 清 sess/target
++        self.assertIsNone(driver.G["sess"])
++        self.assertIsNone(driver.G["target"])
++        self.assertIn("白砚进程已退出", self.log_text())
++        self.assertIn("本章先停", self.log_text())
++
++        driver.tick(cfg)                                 # 同一 live 不自动重试
++        driver.tick(cfg)
++        self.assertEqual(count_frames(self.record, "initialize"), inits)
++        self.assertIsNone(driver.G["sess"])
++        self.assertIn("不自动重试", self.log_text())
++
++    def test_switch_chapter_stops_old_session(self):
++        live = {"v": ("semi", "1")}
++        before = driver.current_live
++        driver.current_live = lambda: live["v"]
++        self.addCleanup(lambda: setattr(driver, "current_live", before))
++        cfg = self.cfg()
++
++        driver.tick(cfg)
++        first = driver.G["sess"]
++        self.sessions.append(first)
++        self.wait_prompts(1)
++
++        live["v"] = ("semi", "2")                        # 同一刻只许一章 live
++        driver.tick(cfg)
++        second = driver.G["sess"]
++        self.sessions.append(second)
++        self.assertIsNot(first, second)
++        self.assertEqual((second.course, second.chapter), ("semi", "2"))
++        self.assertFalse(first.alive())                  # 旧的收掉了
++
++        live["v"] = None                                 # 台子空了：全收掉
++        driver.tick(cfg)
++        self.assertIsNone(driver.G["sess"])
++        self.assertFalse(second.alive())
++        self.assertTrue(wait_for(lambda: "收白砚" in self.log_text()))
++
++    def test_start_failure_logs_command_and_does_not_storm(self):
++        self.patch_live(("semi", "1"))
++        calls = []
++
++        def boom(*args, **kw):
++            calls.append(args)
++            raise OSError(2, "系统找不到指定的文件")
++
++        before = driver.AcpClient
++        driver.AcpClient = boom
++        self.addCleanup(lambda: setattr(driver, "AcpClient", before))
++
++        cfg = self.cfg()
++        driver.tick(cfg)                                 # 起失败：记 dead、本章先不动
++        self.assertIsNone(driver.G["sess"])
++        driver.tick(cfg)
++        driver.tick(cfg)
++        self.assertEqual(len(calls), 1, "同一 live 起了不止一次：%r" % (calls,))
++        log = self.log_text()
++        self.assertIn("起白砚失败", log)
++        self.assertIn("展开后命令", log)
++        self.assertIn("BIN 只放程序本身", log)            # _start_hint 的提示
++        self.assertIn("不会每 2 秒重试", log)
++
++
++class DryRun(DriverCase):
++    """空跑：不 spawn、不登记 sid、不写 inbox，但命令/通道/三帧要打全。"""
++
++    def test_dry_does_not_spawn_or_touch_state(self):
++        sess = self.sess(dry=True, bin_name="x")          # PATH 上没有 x：空跑照样放行
++        sess.start()
++        self.assertFalse(os.path.exists(self.record))     # stub 没被起过
++        self.assertFalse(os.path.exists(self.inbox))      # 没写 inbox
++        self.assertEqual(self.api.sessions, [])           # 空跑不登记 sid
++        self.assertEqual(sess.sid, "(dry)")
++        self.assertEqual(sess.fed, 0)
++        self.assertTrue(sess.alive())                     # 空跑会话别被主循环收掉
++
++        sess.feed("学生：在吗")                            # feed 只打日志
++        self.assertFalse(os.path.exists(self.record))
++
++        log = self.log_text()
++        self.assertIn("会起白砚", log)
++        self.assertIn("会执行", log)
++        self.assertIn("system_prompt channel=meta", log)
++        self.assertIn("clientCapabilities", log)
++        self.assertIn("第一句 prompt 全文", log)
++        self.assertIn("[DRY] 喂白砚：学生：在吗", log)
++        frames = [json.loads(line.split("：", 1)[1]) for line in log.splitlines()
++                  if "帧·" in line]
++        self.assertEqual(len(frames), 3, "三帧没打全：%r" % (frames,))
++        self.assertEqual(frames[0]["method"], "initialize")
++        self.assertEqual(frames[0]["params"]["protocolVersion"], 1)
++        self.assertEqual(frames[0]["params"]["clientCapabilities"],
++                         {"fs": {"readTextFile": False, "writeTextFile": False},
++                          "terminal": False})
++        self.assertEqual(frames[1]["method"], "session/new")
++        self.assertEqual(frames[1]["params"]["_meta"]["systemPrompt"], PERSONA)
++        self.assertEqual(frames[2]["method"], "session/prompt")
++        self.assertEqual(frames[2]["params"]["prompt"][0]["text"][:2], "学生")
++        self.assertNotIn(MARKER, frames[2]["params"]["prompt"][0]["text"])
++
++    def test_dry_preview_shows_load_when_sid_known(self):
++        self.write_sessions("old-sid-9")
++        sess = self.sess(dry=True, bin_name="x")
++        sess.start()
++        log = self.log_text()
++        self.assertIn("帧·2 session/load", log)
++        self.assertIn("续 old-sid-9", log)
++        self.assertEqual(sess.sid, "old-sid-9")
++        self.assertFalse(os.path.exists(self.record))
++
++class ConfigErrors(ScratchCase):
++    """check_config 的每条失败分支 + 空跑放行 + 未知占位符只告警一次。"""
++
++    def test_load_config_rejects_bad_env(self):
++        cases = [
++            ({}, "没设"),
++            ({"TEACH_AGENT_BIN": "python -m agent"}, "空白"),
++            ({"TEACH_AGENT_BIN": BIN_OK, "TEACH_AGENT_ARGS": '--x "unclosed'}, "引号"),
++            ({"TEACH_AGENT_BIN": BIN_OK, "TEACH_AGENT_SYSTEM_PROMPT": "yolo"},
++             "SYSTEM_PROMPT"),
++            ({"TEACH_AGENT_BIN": BIN_OK, "TEACH_AGENT_PERMISSION": "yolo"}, "PERMISSION"),
++            ({"TEACH_AGENT_BIN": BIN_OK, "TEACH_AGENT_PROTOCOL": "2"}, "v2"),
++            ({"TEACH_AGENT_BIN": "definitely-not-a-real-agent-xyz"}, "找不到"),
++        ]
++        for env, needle in cases:
++            with self.assertRaises(driver.ConfigError, msg="env=%r" % (env,)) as cm:
++                driver.load_config(env)
++            self.assertIn(needle, str(cm.exception), "env=%r" % (env,))
++
++    def test_check_config_branches_on_handmade_config(self):
++        bad = [driver.Config(bin=""),
++               driver.Config(bin="a b"),
++               driver.Config(bin=BIN_OK, system_prompt_mode="yolo"),
++               driver.Config(bin=BIN_OK, permission="yolo"),
++               driver.Config(bin=BIN_OK, protocol="2"),
++               driver.Config(bin="definitely-not-a-real-agent-xyz")]
++        for cfg in bad:
++            with self.assertRaises(driver.ConfigError, msg=repr(vars(cfg))):
++                driver.check_config(cfg)
++
++    def test_check_config_returns_none_for_good_config(self):
++        cfg = driver.load_config({"TEACH_AGENT_BIN": BIN_OK})
++        self.assertIsNone(driver.check_config(cfg))
++
++    def test_dry_exempts_missing_bin(self):
++        # 空跑的意义就是不装 agent 也能验配置，所以 PATH 上找不到也放行
++        cfg = driver.load_config({"TEACH_AGENT_BIN": "x", "TEACH_DRY": "1"})
++        self.assertIsNone(cfg.bin_path)
++        self.assertTrue(cfg.dry)
++
++    def test_unknown_placeholder_warns_once_and_keeps_token(self):
++        env = {"TEACH_AGENT_BIN": BIN_OK, "TEACH_AGENT_ARGS": "--x {foo}"}
++        cfg = driver.load_config(env)
++        self.assertEqual(cfg.arg_tokens, ["--x", "{foo}"])
++        self.assertIn("{foo}", self.log_text())
++        driver.load_config(env)
++        self.assertEqual(self.log_text().count("{foo}"), 1)
++
++    def test_legacy_dry_name_falls_back(self):
++        self.assertTrue(driver.read_dry({"DRIVER_DRY": "1"}))
++        self.assertIn("TEACH_DRY", self.log_text())
++
++
++class MainExit(ScratchCase):
++    """main() 配置错就中文报错 + exit 2，不进主循环。"""
++
++    def run_main(self, environ):
++        logs = []
++        before = driver.log
++        driver.log = logs.append
++        try:
++            with self.assertRaises(SystemExit) as cm:
++                driver.main(environ)
++        finally:
++            driver.log = before
++        return cm.exception.code, "\n".join(str(x) for x in logs)
++
++    def test_missing_bin(self):
++        code, text = self.run_main({})
++        self.assertEqual(code, 2)
++        self.assertIn("配置错误", text)
++        self.assertIn("TEACH_AGENT_BIN", text)
++        self.assertIn("驱动器不启动", text)
++
++    def test_bad_permission(self):
++        code, text = self.run_main({"TEACH_AGENT_BIN": BIN_OK,
++                                    "TEACH_AGENT_PERMISSION": "yolo"})
++        self.assertEqual(code, 2)
++        self.assertIn("TEACH_AGENT_PERMISSION", text)
++
++    def test_bad_protocol(self):
++        code, text = self.run_main({"TEACH_AGENT_BIN": BIN_OK, "TEACH_AGENT_PROTOCOL": "2"})
++        self.assertEqual(code, 2)
++        self.assertIn("v2", text)
++
++
++class NoLegacyProtocol(unittest.TestCase):
++    """driver.py 源码扫描：旧协议/Claude 专有的字面量一个都不许留。"""
++
++    LITERALS = ("--input-format", "--output-format", "stream-json",
++                "--dangerously-skip-permissions", "--append-system-prompt")
++    LEGACY_NAMES = ("TEACH_CLAUDE_BIN", "TEACH_CLAUDE_ARGS", "TEACH_CLAUDE_RESUME_FLAG",
++                    "{resume}")
++
++    def setUp(self):
++        self.src = read_text(os.path.join(REPO, "driver.py"))
++
++    def test_old_protocol_literals_count_is_zero(self):
++        for literal in self.LITERALS:
++            self.assertEqual(self.src.count(literal), 0,
++                             "%s 在 driver.py 里出现 %d 次"
++                             % (literal, self.src.count(literal)))
++
++    def test_legacy_env_names_count_is_zero(self):
++        for name in self.LEGACY_NAMES:
++            self.assertEqual(self.src.count(name), 0, "%s 还在 driver.py 里" % name)
++
++    def test_default_agent_args_is_empty(self):
++        # 默认不带任何 flag：起什么 agent、带什么参数全由环境变量说了算
++        self.assertEqual(driver.DEFAULT_AGENT_ARGS, "")
++        self.assertEqual(driver.load_config({"TEACH_AGENT_BIN": BIN_OK}).arg_tokens, [])
++
++
++if __name__ == "__main__":
++    unittest.main()

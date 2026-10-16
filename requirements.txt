@@ -2,4 +2,4 @@
 # 运行只需 Python 3 标准库，无 pip 依赖。
 # 系统级额外需要：
 #   · poppler（pdftoppm / pdftotext）—— 把课本 PDF 渲成图、抽文字层
-#   · 一个讲课分身 CLI —— 默认是 claude，可用环境变量 TEACH_CLAUDE_BIN 换成别的
+#   · 一个讲课分身 CLI —— 由环境变量 TEACH_AGENT_BIN 指定的任意 ACP agent
