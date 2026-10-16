@@ -19,3 +19,12 @@ teach-queue.json
 venv/
 .venv/
 .DS_Store
+
+# 本机携带的 Python 发行版（201MB 二进制，不入库）
+Python/
+
+# 讲稿运行时生成（含会话对话），不入库
+lessons/
+
+# Windows 组件误建的目录（%SystemDrive% 未展开时的系统缓存垃圾）
+%SystemDrive%/
