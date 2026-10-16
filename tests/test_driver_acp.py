@@ -714,6 +714,86 @@ class MainExit(ScratchCase):
         self.assertIn("v2", text)
 
 
+class RecordingClient:
+    """假 ACP 客户端：只记 __init__ 收到的参数，不起任何进程。
+
+    用来断言驱动器**交给客户端的东西**（人格文本 / 子进程环境），不比 stub 起进程慢。
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.argv = args
+        self.kwargs = kwargs
+        self.starts = []
+
+    def start(self, *, session_id=None, load_session=False):
+        self.starts.append((session_id, load_session))
+        return {"sessionId": "sess-fake", "resumed": False}
+
+    def prompt(self, text, *, timeout=None):
+        return {"stopReason": "end_turn"}
+
+    def close(self):
+        pass
+
+
+class LauncherChannel(DriverCase):
+    """launcher 通道：人格不进 _meta、不占 argv，只以 TEACH_PERSONA_FILE 交给启动器。"""
+
+    def recording_sess(self, **kw):
+        """起一个用假客户端顶包的会话，返回 (sess, 客户端列表)。"""
+        made = []
+        before = driver.AcpClient
+
+        def factory(*args, **kwargs):
+            client = RecordingClient(*args, **kwargs)
+            made.append(client)
+            return client
+
+        driver.AcpClient = factory
+        self.addCleanup(lambda: setattr(driver, "AcpClient", before))
+        sess = self.sess(**kw)
+        sess.start()
+        return sess, made
+
+    def test_launcher_sets_persona_file_env_and_skips_meta(self):
+        sess, made = self.recording_sess(system_prompt="launcher")
+        self.assertEqual(len(made), 1, "假客户端没被起过")
+        kwargs = made[0].kwargs
+
+        self.assertIsNone(kwargs["system_prompt"])      # 不挂 _meta
+        path = kwargs["env"][driver.PERSONA_FILE_ENV]
+        self.assertEqual(path, driver.PROMPT_FILE)
+        self.assertTrue(os.path.isabs(path), "启动器只认绝对路径：%r" % (path,))
+        with open(path, encoding="utf-8") as f:
+            self.assertIn(MARKER, f.read())             # 指的就是这一份人格
+        self.assertEqual(kwargs["env"]["TEACH_DRIVER"], "1")
+        self.assertEqual(sess.sid, "sess-fake")
+
+    def test_meta_default_never_sets_persona_env(self):
+        # 反向锁：默认通道不许平白多出一个环境变量（其它 agent 的干净环境）
+        _sess, made = self.recording_sess()
+        self.assertNotIn(driver.PERSONA_FILE_ENV, made[0].kwargs["env"])
+        self.assertEqual(made[0].kwargs["system_prompt"], PERSONA)
+
+    def test_args_mode_never_sets_persona_env(self):
+        _sess, made = self.recording_sess(system_prompt="args")
+        self.assertNotIn(driver.PERSONA_FILE_ENV, made[0].kwargs["env"])
+        self.assertIsNone(made[0].kwargs["system_prompt"])
+
+    def test_dry_launcher_preview(self):
+        sess = self.sess(system_prompt="launcher", dry=True, bin_name="x")
+        sess.start()
+        log = self.log_text()
+        self.assertIn("%s=%s" % (driver.PERSONA_FILE_ENV, driver.PROMPT_FILE), log)
+        self.assertIn("persona=launcher", log)
+        self.assertIn("system_prompt channel=launcher meta_bytes=0", log)
+        frames = [json.loads(line.split("：", 1)[1]) for line in log.splitlines()
+                  if "帧·" in line]
+        self.assertEqual(len(frames), 3, "三帧没打全：%r" % (frames,))
+        self.assertNotIn("_meta", frames[1]["params"])   # launcher 下不挂 _meta
+        self.assertEqual(sess.sid, "(dry)")
+
+
 class NoLegacyProtocol(unittest.TestCase):
     """driver.py 源码扫描：旧协议/Claude 专有的字面量一个都不许留。"""
 

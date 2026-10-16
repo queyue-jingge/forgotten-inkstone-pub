@@ -62,7 +62,7 @@ TEACH_AGENT_BIN=claude-code-acp python3 driver.py
 | `TEACH_BASE` | 驱动器找网页服务的地址 | `http://127.0.0.1:8000` |
 | `TEACH_AGENT_BIN` | 起分身的可执行（**只放程序**：PATH 上的名字或绝对路径）；得是**说 ACP 的 agent**，不是任意 CLI | **必填** |
 | `TEACH_AGENT_ARGS` | 程序之后的全部 flag；支持 3 个占位符，默认空串（一个 flag 都不传） | 空 |
-| `TEACH_AGENT_SYSTEM_PROMPT` | 人格走哪条通道：`meta` / `meta_append` / `args` / `both` / `none` | `meta` |
+| `TEACH_AGENT_SYSTEM_PROMPT` | 人格走哪条通道：`meta` / `meta_append` / `args` / `both` / `launcher` / `none` | `meta` |
 | `TEACH_AGENT_PERMISSION` | 分身请求工具权限时怎么答：`allow` / `deny` / `cancel` | `allow` |
 | `TEACH_AGENT_LOG_UPDATES` | `1` = 把分身的流式说话也打进日志（默认只记工具调用） | `0` |
 | `TEACH_AGENT_PROTOCOL` | ACP 协议版本；这一版只实现了 `1` | `1` |
@@ -109,9 +109,10 @@ set TEACH_AGENT_BIN=C:\path\to\my-acp-agent.exe                    :: 自研 age
 | `meta_append` | 同上（差别只在驱动器日志里点名，方便跟「本机 agent 只认 append」的旧配置对照） |
 | `args` | 只走 argv：`{prompt}` / `{prompt_file}` 展开进 `TEACH_AGENT_ARGS` |
 | `both` | 两条都给 |
+| `launcher` | 都不给，改为把人格文件的**绝对路径**放进 agent 子进程环境 `TEACH_PERSONA_FILE`，由启动器读走（见「接 pi-acp」） |
 | `none` | 都不给（人格文件完全不发，慎用） |
 
-**为什么无法自检**：人格发出去之后，驱动器看不见 agent 到底把它当没当系统提示——ACP 没有回执。所以要么信 agent 的实现，要么用 `args` 明确塞进命令行。**一键切**：
+**为什么无法自检**：人格发出去之后，驱动器看不见 agent 到底把它当没当系统提示——ACP 没有回执。所以要么信 agent 的实现，要么用 `args` 明确塞进命令行，要么用 `launcher` 交给启动器（「接 pi-acp」一节末尾有一条随机暗号的活体测试）。**一键切**：
 
 ```bat
 set TEACH_AGENT_SYSTEM_PROMPT=args
@@ -119,6 +120,45 @@ set TEACH_AGENT_ARGS=--system-prompt {prompt}
 ```
 
 （`args` 通道下人格是**一个** argv token，不会被空白切开；`{prompt_file}` 给的是文件路径。）
+
+## 接 pi-acp（launcher：人格交给启动器）
+
+pi 的 ACP 适配器 [`pi-acp`](https://github.com/svkozak/pi-acp)（0.0.34）**不认** `session/new` 的 `_meta.systemPrompt`——它全文没读这个字段，所以默认的 `meta` 通道对它等于没发；而它起 pi 的命令行又是写死的 `pi --mode rpc --no-themes [--session …]`，只认一个环境变量 `PI_ACP_PI_COMMAND`。
+
+于是有了第四条通道 `launcher`：驱动器**不挂 `_meta`、不占 argv**，只在 agent 子进程环境里放一个 `TEACH_PERSONA_FILE=<人格文件绝对路径>`；再由一个**启动器**把它转成 pi 认识的 `--append-system-prompt <路径>`（pi 对已存在的路径读文件内容，拼进系统提示）。
+
+`tools/pi-persona.cmd` 就是给 Windows 的那个启动器（纯 ASCII；两条守卫：没设变量 → 退出码 2，文件不存在 → 退出码 3）。接线：
+
+```bat
+:: 1) 让 pi-acp 起启动器，而不是直接起 pi（必须绝对路径、必须以 .cmd 结尾：
+::    pi-acp 只对 .cmd / .bat 开 shell）
+set PI_ACP_PI_COMMAND=D:\Source\forgotten-inkstone-pub\tools\pi-persona.cmd
+:: 2) 人格走 launcher 通道（默认仍是 meta，别的 agent 不用改）
+set TEACH_AGENT_SYSTEM_PROMPT=launcher
+:: 3) 把 pi-acp 当 ACP agent 起（也可 TEACH_AGENT_BIN=node + 指向它的 dist\index.js）
+set TEACH_AGENT_BIN=npx
+set TEACH_AGENT_ARGS=-y pi-acp@0.0.34
+python3 driver.py
+```
+
+要点与坑：
+
+- **ACP 协议照旧**：讲台 ↔ pi-acp 还是 ACP v1（`initialize` / `session/new` / `session/prompt` / 权限请求全不变），launcher 只补上「pi-acp 送不到 pi」的那一段。
+- **`@echo off` 是硬要求**：pi-acp 把 pi 的 stdout 当协议管道，非 JSON 行会被它当成「分身说的话」转给客户端。启动器自己的消息一律走 stderr。
+- **启动器里只放 ASCII**：cmd.exe 按 OEM 代码页（简中是 GBK）读 `.cmd`，中文会乱码——所以路径靠环境变量传，脚本里一个中文字都不放。
+- **人格文件必须存在**：pi 对「不存在的路径」是**静默**当字面文本塞进系统提示的（白砚的系统提示里会多出一条路径字符串），所以启动器要守卫。
+- **别走 `~/.pi/agent/APPEND_SYSTEM.md` 这类旁门**：那是 pi 自己的配置，会影响本机**所有** pi 会话（不止讲台），也会让 `TEACH_PROMPT` 自定义人格失效。
+- **只有 pi-acp 需要它**：别的 ACP agent（例如 claude-code-acp）继续用默认的 `meta`。
+- 上游哪天认了 `_meta.systemPrompt`，把这两行配置删掉就回到纯 ACP，代码不用动。
+
+**怎么验证人格真到了**（ACP 没有回执）：人格文件里写一句随机暗号——「每次回答都必须以 `CANARY-xxxx` 开头」——然后看第一轮回复里有没有它。仓库里有一条**默认跳过**的活体测试干这事：
+
+```bat
+set TEACH_LIVE_PI=1
+python3 -m unittest discover -s tests -p "test_pi_live.py" -v
+```
+
+它真起 pi-acp + pi + 真模型（要花 token），并断言那句暗号**不在**用户消息里——所以模型只可能是从系统提示里看到的。
 
 ## ACP 能力边界
 
@@ -146,6 +186,7 @@ set TEACH_AGENT_ARGS=--system-prompt {prompt}
 server.py    网页服务（静态前端 + 页渲染 + 讲稿/白板/收件箱的小接口）
 driver.py    分身驱动器（起停 ACP 分身、喂话、空跑自检）
 acp.py       ACP v1 客户端（stdio 上的 JSON-RPC 2.0；人格挂 _meta.systemPrompt）
+tools/       agent 启动器（pi-persona.cmd：把人格转成 pi 认的 --append-system-prompt）
 teach.py     小工具：分身讲某页前，看那页的文字层与图
 web/         前端（讲稿流、PDF、白板、手写）
 prompts/     分身人设

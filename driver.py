@@ -12,7 +12,12 @@
 
 人格 prompts/白砚.md 默认走**系统提示通道**：acp.py 把全文挂在 session/new 与
 session/load 的 _meta.systemPrompt 上，绝不塞进第一句用户消息。通道由
-TEACH_AGENT_SYSTEM_PROMPT 选（meta 默认 / meta_append / args / both / none）。
+TEACH_AGENT_SYSTEM_PROMPT 选（meta 默认 / meta_append / args / both / launcher / none）。
+
+launcher 那条留给「不认 _meta、但能被启动器包装」的 agent（现成例子：pi-acp 起的
+pi）：驱动器不挂 _meta、不占 argv，只在 agent 子进程环境里放
+TEACH_PERSONA_FILE=<人格文件绝对路径>，由启动器在起 agent 那一刻读走
+（仓库自带 tools/pi-persona.cmd，接线见 README「接 pi-acp」）。
 
 跑：   TEACH_AGENT_BIN=<你的 ACP agent> TEACH_BASE=http://127.0.0.1:8000 python3 driver.py
 空跑： TEACH_DRY=1 TEACH_AGENT_BIN=x python3 driver.py    # 不 spawn，只打命令/通道/三帧
@@ -67,10 +72,13 @@ class ConfigError(Exception):
 
 DEFAULT_AGENT_ARGS = ""
 PLACEHOLDERS = ("prompt", "prompt_file", "session")
-SYSTEM_PROMPT_MODES = ("meta", "meta_append", "args", "both", "none")
+SYSTEM_PROMPT_MODES = ("meta", "meta_append", "args", "both", "launcher", "none")
 PERMISSION_MODES = ("allow", "deny", "cancel")
 # 人格走 _meta 的三种取值（meta_append 的差别只在本侧日志里：acp.py 只收一个字符串）
 META_MODES = ("meta", "meta_append", "both")
+# launcher 通道：人格不进 ACP 帧，改由启动器在起 agent 时自己读（见 Session._launcher_env）
+LAUNCHER_MODE = "launcher"
+PERSONA_FILE_ENV = "TEACH_PERSONA_FILE"
 _KNOWN = "、".join("{" + p + "}" for p in PLACEHOLDERS)
 _BRACED = re.compile(r"\{([^{}]*)\}")
 
@@ -373,7 +381,7 @@ class Session:
         self.sid = None
         self.fed = 0
 
-    # ---- 人格：一个来源，三条通道 ----
+    # ---- 人格：一个来源，四条通道 ----
     def _system_prompt(self):
         """给 acp.py 的人格文本（它挂到 _meta.systemPrompt）；不走 meta 通道时给 None。"""
         if self.cfg.system_prompt_mode in META_MODES:
@@ -387,6 +395,15 @@ class Session:
     def _prompt_file_via_args(self):
         """{prompt_file} 同理：不走 argv 通道时给空串（文件路径也算人格那条路）。"""
         return PROMPT_FILE if self.cfg.system_prompt_mode in ("args", "both") else ""
+
+    def _launcher_env(self):
+        """launcher 通道：把人格文件的绝对路径塞进 agent 子进程环境，由启动器读走。
+
+        别的通道给空 dict——同一份人格不走两条路，也免得给所有 agent 平白多一个变量。
+        """
+        if self.cfg.system_prompt_mode == LAUNCHER_MODE:
+            return {PERSONA_FILE_ENV: PROMPT_FILE}
+        return {}
 
     def _argv(self, sid):
         """展开后的完整命令：真起和空跑共用一份，免得两边对不上。"""
@@ -404,6 +421,11 @@ class Session:
         except Exception as e:
             log(f"读白砚提示词失败：{e}")
             self.prompt_text = ""
+
+        if self.cfg.system_prompt_mode == LAUNCHER_MODE and not self.prompt_text:
+            # 这里不拦：空人格交给启动器守卫去拒（退出码非 0），失败会打在 agent 的启动日志里
+            log(f"launcher 通道拿不到人格正文（{PROMPT_FILE}）：启动器会拒绝启动 agent，"
+                f"先把这个文件修好")
 
         if self.cfg.dry:
             self._dry_report(old_sid, self._seed(old_sid))
@@ -428,7 +450,7 @@ class Session:
         argv = self._argv(sid)
         self.argv = argv
         client = AcpClient(argv[0], argv[1:], cwd=ROOT,
-                           env=dict(os.environ, TEACH_DRIVER="1"),
+                           env=dict(os.environ, TEACH_DRIVER="1", **self._launcher_env()),
                            system_prompt=self._system_prompt(),
                            on_permission=self._on_permission,
                            on_update=self._on_update,
@@ -492,6 +514,9 @@ class Session:
         log(f"[DRY] system_prompt channel={self.cfg.system_prompt_mode} "
             f"meta_bytes={len(self._system_prompt() or '')} "
             f"argv_prompt={'是' if self._prompt_via_args() else '否'}")
+        if self.cfg.system_prompt_mode == LAUNCHER_MODE:
+            log(f"[DRY] persona=launcher {PERSONA_FILE_ENV}={PROMPT_FILE}"
+                f"（启动器读走，不挂 _meta）")
         log(f"[DRY] clientCapabilities={json.dumps(CLIENT_CAPABILITIES, ensure_ascii=False)}")
         for label, frame in dry_frames(self.cfg, old_sid, self._system_prompt(), seed):
             log(f"[DRY] 帧·{label}：{json.dumps(frame, ensure_ascii=False)}")
