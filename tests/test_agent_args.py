@@ -146,7 +146,7 @@ class ConfigDefaults(TempLog):
 
     def test_modes(self):
         self.assertEqual(driver.SYSTEM_PROMPT_MODES,
-                         ("meta", "meta_append", "args", "both", "launcher", "none"))
+                         ("meta", "meta_append", "args", "both", "launcher", "first", "none"))
         self.assertEqual(driver.PERMISSION_MODES, ("allow", "deny", "cancel"))
 
 

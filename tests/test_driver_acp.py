@@ -364,10 +364,22 @@ class NewSession(DriverCase):
 
 
 class SystemPromptChannels(DriverCase):
-    """人格的三条通道：meta（默认）/ args / both / none。"""
+    """人格的通道：meta（默认）/ args / both / first / none。"""
 
     def args_template(self):
         return '"%s" --persona {prompt} {prompt_file}' % STUB
+
+    def test_first_channel_persona_rides_first_prompt(self):
+        # first 通道（codex / opencode / dsh 预设默认）：人格不挂 _meta、不占 argv，
+        # 拼在开场第一句用户消息前——给不认 _meta.systemPrompt 的 agent 的兜底
+        sess = self.sess(system_prompt="first", args=self.args_template())
+        sess.start()
+        self.wait_prompts(1)
+        self.assertEqual(sess.argv, [BIN_OK, STUB, "--persona", "", ""])
+        new = find_frame(self.frames(), "session/new")
+        self.assertNotIn("_meta", new["params"])
+        self.assertIn(MARKER, self.prompts()[0])
+        self.assertIn(PERSONA, self.prompts()[0])
 
     def test_args_channel_persona_is_single_argv_token(self):
         sess = self.sess(system_prompt="args", args=self.args_template())

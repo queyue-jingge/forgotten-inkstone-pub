@@ -33,8 +33,8 @@ export TEACH_BOOKS=/path/to/books
 # 2) 起网页服务
 TEACH_PASS=你的口令 python3 server.py      # 默认端口 8000
 
-# 3) 另开一个终端，起分身驱动器（先装好 ACP agent，见「接一个 ACP 分身」）
-TEACH_AGENT_BIN=claude-code-acp python3 driver.py
+# 3) 另开一个终端，起分身驱动器（先装好 ACP agent，见「接一个 ACP 分身」；一键预设见下一节）
+TEACH_AGENT=claude python3 driver.py        # 或 TEACH_AGENT_BIN=claude-code-acp
 ```
 
 浏览器打开 `http://127.0.0.1:8000`。选课程、选章节、点「唤醒本节」，驱动器就会拉起这一章的分身开讲。
@@ -60,9 +60,10 @@ TEACH_AGENT_BIN=claude-code-acp python3 driver.py
 | `TEACH_QUEUE` | 开讲请求队列文件 | 仓库内 `teach-queue.json` |
 | `TEACH_PROMPT` | 分身人设提示词 | `prompts/白砚.md` |
 | `TEACH_BASE` | 驱动器找网页服务的地址 | `http://127.0.0.1:8000` |
+| `TEACH_AGENT` | 一键预设：`claude` / `codex` / `opencode` / `dsh`（给 BIN/ARGS/SYSTEM_PROMPT 填默认，可逐项覆盖，见「一键预设」） | 未设 |
 | `TEACH_AGENT_BIN` | 起分身的可执行（**只放程序**：PATH 上的名字或绝对路径）；得是**说 ACP 的 agent**，不是任意 CLI | **必填** |
 | `TEACH_AGENT_ARGS` | 程序之后的全部 flag；支持 3 个占位符，默认空串（一个 flag 都不传） | 空 |
-| `TEACH_AGENT_SYSTEM_PROMPT` | 人格走哪条通道：`meta` / `meta_append` / `args` / `both` / `launcher` / `none` | `meta` |
+| `TEACH_AGENT_SYSTEM_PROMPT` | 人格走哪条通道：`meta` / `meta_append` / `args` / `both` / `launcher` / `first` / `none` | `meta` |
 | `TEACH_AGENT_PERMISSION` | 分身请求工具权限时怎么答：`allow` / `deny` / `cancel` | `allow` |
 | `TEACH_AGENT_LOG_UPDATES` | `1` = 把分身的流式说话也打进日志（默认只记工具调用） | `0` |
 | `TEACH_AGENT_PROTOCOL` | ACP 协议版本；这一版只实现了 `1` | `1` |
@@ -76,10 +77,36 @@ TEACH_AGENT_BIN=claude-code-acp python3 driver.py
 先装一个 ACP agent，再用 `TEACH_AGENT_BIN` 指过去（**必填**，只放程序本身）：
 
 ```bat
+set TEACH_AGENT=claude                                             :: 一键预设：见下一节，四选一
 set TEACH_AGENT_BIN=claude-code-acp                                 :: npm i -g @zed-industries/claude-code-acp（读 _meta.systemPrompt）
 set TEACH_AGENT_BIN=opencode & set TEACH_AGENT_ARGS=acp             :: 本机已有 opencode
 set TEACH_AGENT_BIN=C:\path\to\my-acp-agent.exe                    :: 自研 agent
 ```
+
+### 一键预设：TEACH_AGENT=claude / codex / opencode / dsh
+
+装好对应 agent 后，`TEACH_AGENT` 一个变量把四款主流 agent 接成分身。预设**只**给 `TEACH_AGENT_BIN` / `TEACH_AGENT_ARGS` / `TEACH_AGENT_SYSTEM_PROMPT` 填默认值——这三个变量显式设了任何一个都逐项优先，权限、日志、协议等其余配置不归预设管：
+
+| 预设 | 会执行 | 先装 | 人格通道 |
+|---|---|---|---|
+| `claude` | `claude-code-acp` | `npm i -g @zed-industries/claude-code-acp`（还要 `claude` CLI + 登录） | `meta`（该适配器实测读 `_meta.systemPrompt`） |
+| `codex` | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp`（ChatGPT 登录或 `CODEX_API_KEY`；包里自带 codex） | `first` |
+| `opencode` | `opencode acp` | 装 [opencode](https://opencode.ai/docs/acp/)（模型/认证走它自己的配置） | `first` |
+| `dsh` | `dsh --profile acp` | `dsh plugin --profile acp add @deepseek-ai/dsh-acp`（或社区的 `@dsh-enhanced/acp`），模型在 profile 配置里选 | `first` |
+
+```bat
+set TEACH_AGENT=claude    :: 或 codex / opencode / dsh
+python3 driver.py
+```
+
+**为什么 codex / opencode / dsh 预设的人格走 `first`**：ACP 官方还没有「客户端系统提示」的标准字段（[草案](https://agentclientprotocol.com/rfds/client-system-prompt.md)进行中）；`_meta.systemPrompt` 是**非标准扩展**，四家里只有 claude-code-acp 实测认它——codex-acp 与 dsh 的两个 ACP 适配器（官方 `@deepseek-ai/dsh-acp`、社区 `@dsh-enhanced/acp`）的代码里压根没有这个字段，opencode 未证实。`first` 通道把人格全文拼在**开场第一句用户消息**前（见下一节通道表），只发一次、续会话不重发——任何 ACP agent 都吃第一句用户消息，这是最稳的兜底。哪天你确认手里的 agent 认 `_meta`，`set TEACH_AGENT_SYSTEM_PROMPT=meta` 切回来即可，代码不用动；人格真没到怎么验，用「接 pi-acp」末尾的随机暗号活体测法。
+
+每家的注意点：
+
+- **codex**：分身要跑 `python3 teach.py view`、往本机 `POST /api/append` 写讲稿，默认 `read-only` 沙箱会卡——建议 `set INITIAL_AGENT_MODE=agent`（档位：`read-only` / `workspace-write` / `agent` / `agent-full-access`）。
+- **dsh**：`acp` profile 里装哪个 ACP 插件都行（官方包偏自动化、社区包多模式/模型映射，Windows 自述实验性）；Windows 上 `dsh` 解析不到就显式 `set TEACH_AGENT_BIN=dsh.cmd`。
+- **opencode / dsh 的续会话**：各家对 `session/load` 支持不一；不支持时驱动器会自动丢旧会话、重开一个并写日志，讲稿在网页上不丢，不用你管。
+- 预设**不锁版本**；上表按 2026-10 实测：claude-code-acp 0.16.2、codex-acp 2.2.2、@deepseek-ai/dsh-acp 0.2.0-rc.2、@dsh-enhanced/acp 0.1.53，四家握手都是 ACP v1。
 
 `TEACH_AGENT_ARGS` 是**程序之后**的全部 flag，按空白切成 argv；默认空串（一个 flag 都不传）——多数 ACP agent 不需要额外参数。里面可以放三个占位符：
 
@@ -99,7 +126,7 @@ set TEACH_AGENT_BIN=C:\path\to\my-acp-agent.exe                    :: 自研 age
 
 ## 人格 = 系统提示
 
-`prompts/白砚.md` 是分身的人格，**默认走系统提示通道**：驱动器把全文交给 ACP 客户端，客户端挂在 `session/new`（续会话时是 `session/load`）的 `_meta.systemPrompt` 上。人格不占第一句用户消息——第一句只交代「哪门课、哪一章、从哪页起、去讲吧」。
+`prompts/白砚.md` 是分身的人格，**默认走系统提示通道**：驱动器把全文交给 ACP 客户端，客户端挂在 `session/new`（续会话时是 `session/load`）的 `_meta.systemPrompt` 上。人格不占第一句用户消息——第一句只交代「哪门课、哪一章、从哪页起、去讲吧」（`first` 通道例外，人格就拼在这第一句前，见下表）。
 
 `TEACH_AGENT_SYSTEM_PROMPT` 选通道：
 
@@ -110,6 +137,7 @@ set TEACH_AGENT_BIN=C:\path\to\my-acp-agent.exe                    :: 自研 age
 | `args` | 只走 argv：`{prompt}` / `{prompt_file}` 展开进 `TEACH_AGENT_ARGS` |
 | `both` | 两条都给 |
 | `launcher` | 都不给，改为把人格文件的**绝对路径**放进 agent 子进程环境 `TEACH_PERSONA_FILE`，由启动器读走（见「接 pi-acp」） |
+| `first` | 都不挂，人格全文拼在**开场第一句用户消息**前（分隔符包清楚，只发一次、续会话不重发）——给不认 `_meta.systemPrompt` 的 agent 的兜底，`codex` / `opencode` / `dsh` 预设默认走它 |
 | `none` | 都不给（人格文件完全不发，慎用） |
 
 **为什么无法自检**：人格发出去之后，驱动器看不见 agent 到底把它当没当系统提示——ACP 没有回执。所以要么信 agent 的实现，要么用 `args` 明确塞进命令行，要么用 `launcher` 交给启动器（「接 pi-acp」一节末尾有一条随机暗号的活体测试）。**一键切**：

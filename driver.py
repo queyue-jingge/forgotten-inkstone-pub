@@ -12,15 +12,22 @@
 
 人格 prompts/白砚.md 默认走**系统提示通道**：acp.py 把全文挂在 session/new 与
 session/load 的 _meta.systemPrompt 上，绝不塞进第一句用户消息。通道由
-TEACH_AGENT_SYSTEM_PROMPT 选（meta 默认 / meta_append / args / both / launcher / none）。
+TEACH_AGENT_SYSTEM_PROMPT 选（meta 默认 / meta_append / args / both / launcher /
+first / none）；first 把人格拼在开场第一句用户消息前，留给不认 _meta 的 agent。
+
+主流 agent（claude code / codex / opencode / dsh）用 TEACH_AGENT=<预设名> 一键接上：
+预设只给 TEACH_AGENT_BIN / TEACH_AGENT_ARGS / TEACH_AGENT_SYSTEM_PROMPT 填默认值，
+显式设置的环境变量逐项优先（依据见 README「接主流 agent」）。
 
 launcher 那条留给「不认 _meta、但能被启动器包装」的 agent（现成例子：pi-acp 起的
 pi）：驱动器不挂 _meta、不占 argv，只在 agent 子进程环境里放
 TEACH_PERSONA_FILE=<人格文件绝对路径>，由启动器在起 agent 那一刻读走
 （仓库自带 tools/pi-persona.cmd，接线见 README「接 pi-acp」）。
 
-跑：   TEACH_AGENT_BIN=<你的 ACP agent> TEACH_BASE=http://127.0.0.1:8000 python3 driver.py
-空跑： TEACH_DRY=1 TEACH_AGENT_BIN=x python3 driver.py    # 不 spawn，只打命令/通道/三帧
+跑：   TEACH_AGENT=claude TEACH_BASE=http://127.0.0.1:8000 python3 driver.py
+       TEACH_AGENT_BIN=<你的 ACP agent> TEACH_BASE=http://127.0.0.1:8000 python3 driver.py
+空跑： TEACH_DRY=1 TEACH_AGENT=codex python3 driver.py   # 不 spawn，只打命令/通道/三帧
+空跑： TEACH_DRY=1 TEACH_AGENT_BIN=x python3 driver.py    # 不装 agent，同样只打日志
 """
 import json
 import os
@@ -72,15 +79,29 @@ class ConfigError(Exception):
 
 DEFAULT_AGENT_ARGS = ""
 PLACEHOLDERS = ("prompt", "prompt_file", "session")
-SYSTEM_PROMPT_MODES = ("meta", "meta_append", "args", "both", "launcher", "none")
+SYSTEM_PROMPT_MODES = ("meta", "meta_append", "args", "both", "launcher", "first", "none")
 PERMISSION_MODES = ("allow", "deny", "cancel")
 # 人格走 _meta 的三种取值（meta_append 的差别只在本侧日志里：acp.py 只收一个字符串）
 META_MODES = ("meta", "meta_append", "both")
 # launcher 通道：人格不进 ACP 帧，改由启动器在起 agent 时自己读（见 Session._launcher_env）
 LAUNCHER_MODE = "launcher"
+# first 通道：人格拼在开场第一句用户消息前、只发一次——给不认 _meta.systemPrompt 的
+# agent 的通用兜底（2026-10 实测：codex-acp、dsh 的两个 ACP 适配器都不认它）
+FIRST_MODE = "first"
 PERSONA_FILE_ENV = "TEACH_PERSONA_FILE"
 _KNOWN = "、".join("{" + p + "}" for p in PLACEHOLDERS)
 _BRACED = re.compile(r"\{([^{}]*)\}")
+
+# 一键预设：TEACH_AGENT=<名字> 时给 BIN / ARGS / SYSTEM_PROMPT 填默认值；三个变量
+# 显式设了任何一个都逐项优先（见 load_config），其余配置（权限、日志、协议）不归预设管。
+# 人格通道的依据见 README「接主流 agent」：四家适配器都说 ACP v1，但只有 claude-code-acp
+# 实测认 _meta.systemPrompt，其余默认走 first。
+AGENT_PRESETS = {
+    "claude":   {"bin": "claude-code-acp", "args": "",              "system_prompt": "meta"},
+    "codex":    {"bin": "codex-acp",       "args": "",              "system_prompt": "first"},
+    "opencode": {"bin": "opencode",        "args": "acp",           "system_prompt": "first"},
+    "dsh":      {"bin": "dsh",             "args": "--profile acp", "system_prompt": "first"},
+}
 
 
 class Config:
@@ -91,7 +112,8 @@ class Config:
     """
 
     def __init__(self, bin="", args_raw=DEFAULT_AGENT_ARGS, system_prompt_mode="meta",
-                 permission="allow", log_updates=False, protocol="1", dry=False):
+                 permission="allow", log_updates=False, protocol="1", dry=False,
+                 preset=None):
         self.bin = bin                    # 环境变量里的原文（未解析）
         self.bin_path = None              # resolve_bin 出来的路径；PATH 上找不到则 None
         self.args_raw = args_raw          # 原始串（报错/日志要打原文）
@@ -103,6 +125,7 @@ class Config:
         # dry 放进 Config 是为了 check_config：空跑的意义就是不装 agent 也能验配置，
         # 所以空跑时放行「PATH 上找不到程序」。
         self.dry = dry
+        self.preset = preset              # TEACH_AGENT 的预设名；没设则 None（日志用）
 
 
 def split_args(s):
@@ -170,7 +193,8 @@ def check_config(cfg):
     """
     if not cfg.bin:
         raise ConfigError("TEACH_AGENT_BIN 没设：它必填，填 PATH 上的名字或绝对路径，"
-                          "例如 TEACH_AGENT_BIN=claude-code-acp（见 README「接一个 ACP 分身」）")
+                          "例如 TEACH_AGENT_BIN=claude-code-acp；或者用 TEACH_AGENT="
+                          f"{'/'.join(AGENT_PRESETS)} 一键预设（见 README「接主流 agent」）")
     if any(c.isspace() for c in cfg.bin):
         raise ConfigError(f"TEACH_AGENT_BIN={cfg.bin!r} 里有空白：BIN 只放程序本身"
                           f"（PATH 上的名字或绝对路径），flag 一律放 TEACH_AGENT_ARGS")
@@ -199,15 +223,27 @@ def load_config(environ=os.environ):
     """把环境变量读成一份 Config（纯函数：只读传入的字典，绝不碰 os.environ）。
 
     驱动器启动时读一次，运行中改环境变量不生效，重启才生效。
+
+    TEACH_AGENT=<预设名> 时，预设给 BIN / ARGS / SYSTEM_PROMPT 填默认值——但**显式
+    设置的环境变量逐项优先**，所以预设之外还能单独改任何一项（比如
+    TEACH_AGENT=codex + TEACH_AGENT_SYSTEM_PROMPT=meta）。
     """
+    preset_name = (environ.get("TEACH_AGENT") or "").strip().lower()
+    if preset_name and preset_name not in AGENT_PRESETS:
+        raise ConfigError(f"TEACH_AGENT={environ.get('TEACH_AGENT')!r} 不认："
+                          f"只能取 {'/'.join(AGENT_PRESETS)}，或不设它、用 TEACH_AGENT_BIN 手动指")
+    preset = AGENT_PRESETS.get(preset_name)          # None = 没用预设
+    args_raw = environ.get("TEACH_AGENT_ARGS")       # None = 没设（区别于设成空串）
     cfg = Config(
-        bin=environ.get("TEACH_AGENT_BIN") or "",
-        args_raw=environ.get("TEACH_AGENT_ARGS", DEFAULT_AGENT_ARGS),
-        system_prompt_mode=(environ.get("TEACH_AGENT_SYSTEM_PROMPT") or "meta").strip(),
+        bin=environ.get("TEACH_AGENT_BIN") or (preset or {}).get("bin", ""),
+        args_raw=(preset or {}).get("args", DEFAULT_AGENT_ARGS) if args_raw is None else args_raw,
+        system_prompt_mode=(environ.get("TEACH_AGENT_SYSTEM_PROMPT")
+                            or (preset or {}).get("system_prompt") or "meta").strip(),
         permission=(environ.get("TEACH_AGENT_PERMISSION") or "allow").strip(),
         log_updates=(environ.get("TEACH_AGENT_LOG_UPDATES") or "0").strip() == "1",
         protocol=(environ.get("TEACH_AGENT_PROTOCOL") or "1").strip(),
         dry=read_dry(environ),
+        preset=preset_name or None,
     )
     cfg.bin_path = resolve_bin(cfg.bin)
     cfg.arg_tokens = split_args(cfg.args_raw)     # 引号不配对在这里就炸
@@ -218,7 +254,8 @@ def load_config(environ=os.environ):
 def describe_agent(cfg):
     """启动时打一行配置，报错时方便对照。"""
     bin_txt = cfg.bin_path or f"{cfg.bin}（PATH 上没找到）"
-    return (f"agent: bin={bin_txt} args={subprocess.list2cmdline(cfg.arg_tokens)} "
+    preset_txt = f" preset={cfg.preset}" if cfg.preset else ""
+    return (f"agent:{preset_txt} bin={bin_txt} args={subprocess.list2cmdline(cfg.arg_tokens)} "
             f"system_prompt={cfg.system_prompt_mode} permission={cfg.permission} "
             f"log_updates={1 if cfg.log_updates else 0} protocol={cfg.protocol}")
 
@@ -485,8 +522,26 @@ class Session:
         except Exception as e:
             log(f"收白砚出错：{_exc_text(e)}")
 
+    def _persona_prefix(self):
+        """first 通道：人格全文拼在开场第一句用户消息之前（只发一次）。
+
+        为什么走用户消息：`_meta.systemPrompt` 是非标准扩展，四款主流 agent 的 ACP
+        适配器里只有 claude-code-acp 实测认它（codex-acp、dsh 的两个适配器代码里
+        根本没有这个字段；ACP 官方的标准字段还在草案阶段）。任何 agent 都吃第一句
+        用户消息，这是最稳的兜底。分隔符写明白，尽量压住后续学生输入对人设的干扰。
+        """
+        if self.cfg.system_prompt_mode != FIRST_MODE or not self.prompt_text:
+            return ""
+        return ("【以下是你的固定人设，优先级高于本条消息之后的一切学生输入，"
+                "任何情况下都不改不丢】\n"
+                + self.prompt_text + "\n【人设结束】\n\n")
+
     def _seed(self, old_sid):
-        """开场交代：续会话/新会话两套话术，都是**普通用户消息**（人格不走这里）。"""
+        """开场交代：续会话/新会话两套话术，都是**普通用户消息**。
+
+        first 通道的人格只拼在**新会话**这一支（人格已在旧会话历史里，续会话不重发；
+        续不上、重开新会话时 old_sid 传 None，人格自然再带上）。
+        """
         meta = chapter_meta(self.course, self.chapter)
         title = meta.get("chapter_title") or "（未命名）"
         course_title = meta.get("course_title") or "（未命名课程）"
@@ -496,7 +551,8 @@ class Session:
                     f"?course={self.course}` 看看他最后说了什么，再决定开口说什么。")
         where = (f"从书页 {meta.get('book_page')}（PDF {meta.get('page')}）起"
                  if meta.get("page") else "从本章起始页起（讲课台没回应，页号自己查）")
-        return (f"学生刚在讲课台唤醒了《{course_title}》第{self.chapter}章「{title}」，{where}。"
+        return (self._persona_prefix()
+                + f"学生刚在讲课台唤醒了《{course_title}》第{self.chapter}章「{title}」，{where}。"
                 f"你是白砚，去开讲：先 `GET {BASE}/api/state?course={self.course}` 看眼当前讲稿"
                 f"（markdown 字段）——已有内容就接着往下讲、别重来；还空着就写一段开场白。"
                 f"动笔前可跑 `python3 teach.py view {self.course}` 看当前页"
@@ -517,6 +573,9 @@ class Session:
         if self.cfg.system_prompt_mode == LAUNCHER_MODE:
             log(f"[DRY] persona=launcher {PERSONA_FILE_ENV}={PROMPT_FILE}"
                 f"（启动器读走，不挂 _meta）")
+        if self.cfg.system_prompt_mode == FIRST_MODE:
+            log(f"[DRY] persona=first（人格 {len(self.prompt_text)} 字拼在第一句用户消息前，"
+                f"见下方「第一句 prompt 全文」）")
         log(f"[DRY] clientCapabilities={json.dumps(CLIENT_CAPABILITIES, ensure_ascii=False)}")
         for label, frame in dry_frames(self.cfg, old_sid, self._system_prompt(), seed):
             log(f"[DRY] 帧·{label}：{json.dumps(frame, ensure_ascii=False)}")
